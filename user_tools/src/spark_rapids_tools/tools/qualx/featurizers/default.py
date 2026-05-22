@@ -224,11 +224,18 @@ def extract_raw_features(
                      fallback_reason=f'Empty feature tables found after preprocessing: {empty_tables_str}')
         return pd.DataFrame(columns=list(expected_raw_features))
 
-    if get_label() == 'duration_sum':
+    label = get_label()
+    duration_sum_total = None
+    if label == 'duration_sum':
         # override appDuration with sum(duration_sum) across all stages per appId
         app_duration_sum = job_stage_agg_tbl.groupby('appId')['duration_sum'].sum().reset_index()
         app_duration_sum = app_duration_sum.rename(columns={'duration_sum': 'appDuration'})
         app_tbl = app_tbl.merge(app_duration_sum, on=['appId'], how='left', suffixes=['_orig', None])
+        duration_sum_total = (
+            job_stage_agg_tbl.groupby(['appId', 'sqlID'], as_index=False)['duration_sum']
+            .sum()
+            .rename(columns={'duration_sum': 'duration_sum_total'})
+        )
 
     # ensure task features are valid floats
     app_task_features = ['taskCpu', 'taskGpu']
@@ -309,6 +316,7 @@ def extract_raw_features(
         if cc.split('_')[-1] in ['sum', 'min', 'max', 'mean']
     }
 
+    sql_job_agg_tbl = job_stage_agg_tbl
     if node_level_supp is not None and (qualtool_filter == 'stage'):
         # if supported exec info supplied aggregate features only over supported stages
         sql_job_agg_tbl = job_stage_agg_tbl.loc[job_stage_agg_tbl['Exec Is Supported']]
@@ -317,7 +325,7 @@ def extract_raw_features(
             return pd.DataFrame(columns=list(expected_raw_features))
 
     # aggregate using reduce ops, recomputing duration_mean
-    sql_job_agg_tbl = job_stage_agg_tbl.groupby(
+    sql_job_agg_tbl = sql_job_agg_tbl.groupby(
         ['appId', 'appName', 'sqlID'], as_index=False
     ).agg(job_stage_reduce_cols)
     sql_job_agg_tbl['duration_mean'] = (
@@ -511,6 +519,11 @@ def extract_raw_features(
 
     # impute inf/nan
     full_tbl[ds_cols] = full_tbl[ds_cols].replace([np.inf, -np.inf], 0).fillna(0)
+
+    if duration_sum_total is not None:
+        full_tbl = full_tbl.merge(duration_sum_total, on=['appId', 'sqlID'], how='left')
+        full_tbl['duration_sum'] = full_tbl['duration_sum_total']
+        full_tbl.drop(columns=['duration_sum_total'], inplace=True)
 
     # warn if any appIds are missing after preprocessing
     missing_app_ids = list(set(unique_app_ids) - set(full_tbl['appId'].unique()))
