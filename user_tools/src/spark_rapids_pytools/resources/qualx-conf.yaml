@@ -24,6 +24,7 @@ modifiers:
 #  positive: 1.0
 #  negative: 1.0
 label: Duration
+#duration_sum_stage_type: false
 split_functions:
   train: split_train_val.py
   test: split_all_test.py

@@ -36,7 +36,9 @@ from spark_rapids_tools.tools.qualx.config import (
     get_cache_dir,
     get_config,
     get_label,
+    is_duration_sum_stage_type_enabled,
 )
+from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
 from spark_rapids_tools.tools.qualx.preprocess import (
     load_datasets,
     load_profiles,
@@ -270,7 +272,49 @@ def _get_split_fn(split_fn: Union[str, dict]) -> Callable[[pd.DataFrame], pd.Dat
     return plugin.split_function
 
 
+def _roll_up_stage_type_predictions(results: pd.DataFrame) -> pd.DataFrame:
+    """Roll stageType prediction rows up to one duration-consistent row per SQL ID."""
+    if (
+        not is_duration_sum_stage_type_enabled()
+        or results.empty
+        or STAGE_TYPE_COL not in results.columns
+    ):
+        return results
+
+    label = get_label()
+    group_by_cols = [
+        'appName',
+        'appId',
+        'appDuration',
+        'sqlID',
+        'scaleFactor',
+        'description',
+    ]
+    if 'split' in results.columns:
+        group_by_cols.append('split')
+
+    agg_cols = {
+        label: 'sum',
+        f'{label}_pred': 'sum',
+        f'{label}_supported': 'sum',
+    }
+    gpu_label_col = f'gpu_{label}'
+    if gpu_label_col in results.columns:
+        agg_cols[gpu_label_col] = 'sum'
+
+    rolled = results.groupby(group_by_cols, as_index=False).agg(agg_cols)
+    rolled['speedup_pred'] = rolled[label] / rolled[f'{label}_pred']
+    rolled['speedup_pred'] = rolled['speedup_pred'].replace([np.inf, -np.inf], 1.0).fillna(1.0)
+    if 'y_pred' in results.columns:
+        rolled['y_pred'] = rolled['speedup_pred']
+    if gpu_label_col in rolled.columns:
+        rolled['y'] = rolled[label] / rolled[gpu_label_col]
+        rolled['y'] = rolled['y'].replace([np.inf, -np.inf], np.nan)
+    return rolled
+
+
 def _compute_summary(results: pd.DataFrame) -> pd.DataFrame:
+    results = _roll_up_stage_type_predictions(results)
     # summarize speedups per appId
     label = get_label()
     result_cols = [
@@ -376,6 +420,7 @@ def _predict(
         # note: dataset name is already stored in the 'appName' field
         try:
             results = predict_model(xgb_model, features, feature_cols, label_col, calib_params)
+            results = _roll_up_stage_type_predictions(results)
 
             # compute per-app speedups
             summary = _compute_summary(results)
@@ -819,6 +864,7 @@ def predict(
     per_app_summary = None
     try:
         per_sql_summary = predictions
+        per_sql_summary = _roll_up_stage_type_predictions(per_sql_summary)
 
         # save features, feature importance, and shapley values per dataset name
         if output_info:

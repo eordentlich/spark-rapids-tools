@@ -19,6 +19,7 @@ Environment variables:
 - QUALX_DATA_DIR: data directory containing eventlogs, primarily used in dataset JSON files.
 - QUALX_DIR: root directory for Qualx execution, primarily used in dataset JSON files to locate
     dataset-specific plugins.
+- QUALX_DURATION_SUM_STAGE_TYPE: split duration_sum rows by input-scan and non-input-scan stages.
 - QUALX_LABEL: targeted label column for XGBoost model.
 - SPARK_RAPIDS_TOOLS_JAR: path to Spark RAPIDS Tools JAR file.
 """
@@ -50,3 +51,9 @@ def get_cache_dir() -> str:
 def get_label() -> str:
     """Get targeted label column for XGBoost model."""
     return get_config().label
+
+
+def is_duration_sum_stage_type_enabled() -> bool:
+    """Whether duration_sum rows should be modeled at stage-type granularity."""
+    config = get_config()
+    return config.label == 'duration_sum' and config.duration_sum_stage_type

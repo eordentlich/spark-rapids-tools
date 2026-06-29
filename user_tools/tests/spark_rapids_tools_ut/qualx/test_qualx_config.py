@@ -57,6 +57,7 @@ class TestQualxConfig(SparkRapidsToolsUT):
         config = QualxConfig(**qualx_config_params)
         assert config.cache_dir == 'qualx_cache'
         assert config.label == 'Duration'
+        assert not config.duration_sum_stage_type
         assert config.alignment_dir is None
 
     def test_environment_variable_overrides(self, monkeypatch, qualx_config_params):
@@ -71,6 +72,11 @@ class TestQualxConfig(SparkRapidsToolsUT):
         config = QualxConfig(**qualx_config_params)
         assert config.label == 'duration_sum'
 
+        # Test QUALX_DURATION_SUM_STAGE_TYPE override with valid label
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'true')
+        config = QualxConfig(**qualx_config_params)
+        assert config.duration_sum_stage_type
+
         # Test QUALX_LABEL override with invalid value
         monkeypatch.setenv('QUALX_LABEL', 'invalid_label')
         with pytest.raises(ValueError):
@@ -79,9 +85,22 @@ class TestQualxConfig(SparkRapidsToolsUT):
         # Test that environment variables are properly reset
         monkeypatch.delenv('QUALX_CACHE_DIR')
         monkeypatch.delenv('QUALX_LABEL')
+        monkeypatch.delenv('QUALX_DURATION_SUM_STAGE_TYPE')
         config = QualxConfig(**qualx_config_params)
         assert config.cache_dir == 'qualx_cache'
         assert config.label == 'Duration'
+
+    def test_stage_type_requires_duration_sum(self, qualx_config_params):
+        """Test duration_sum_stage_type is valid only for duration_sum labels."""
+        config_params = qualx_config_params.copy()
+        config_params['label'] = 'duration_sum'
+        config_params['duration_sum_stage_type'] = True
+        config = QualxConfig(**config_params)
+        assert config.duration_sum_stage_type
+
+        config_params['label'] = 'Duration'
+        with pytest.raises(ValueError):
+            QualxConfig(**config_params)
 
     def test_load_from_file(self):
         """Test loading configuration from a file"""

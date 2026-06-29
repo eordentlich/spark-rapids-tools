@@ -32,6 +32,11 @@ from spark_rapids_tools.tools.qualx.model import (
     calibrate,
     compute_shapley_values,
 )
+from spark_rapids_tools.tools.qualx.stage_type import (
+    STAGE_TYPE_COL,
+    STAGE_TYPE_INPUT_SCAN,
+    STAGE_TYPE_NO_INPUT_SCAN,
+)
 from spark_rapids_tools.tools.qualx.util import get_abs_path, load_plugin
 from ..conftest import SparkRapidsToolsUT
 
@@ -170,6 +175,50 @@ class TestModel(SparkRapidsToolsUT):
         positive_weight, negative_weight = compute_sample_weights(y, threshold, 'auto', 'auto')
         assert positive_weight == 1.0
         assert negative_weight == 1.0
+
+    def test_extract_model_features_duration_sum_stage_type(self, monkeypatch) -> None:
+        """Test duration_sum labels are aligned at stageType granularity."""
+        monkeypatch.setenv('QUALX_LABEL', 'duration_sum')
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'true')
+        get_config(reload=True)
+
+        rows = []
+        for run_type, scan_duration, no_scan_duration in [
+            ('CPU', 100.0, 300.0),
+            ('GPU', 50.0, 150.0),
+        ]:
+            for stage_type, duration_sum in [
+                (STAGE_TYPE_INPUT_SCAN, scan_duration),
+                (STAGE_TYPE_NO_INPUT_SCAN, no_scan_duration),
+            ]:
+                row = {feature: 0 for feature in expected_raw_features()}
+                row.update({
+                    'appName': 'test_app',
+                    'appId': f'{run_type.lower()}_app',
+                    'appDuration': 400.0 if run_type == 'CPU' else 200.0,
+                    'description': 'query',
+                    'Duration': duration_sum,
+                    'duration_sum': duration_sum,
+                    'fraction_supported': 1.0,
+                    'runType': run_type,
+                    'scaleFactor': 1,
+                    'sqlID': 7,
+                    STAGE_TYPE_COL: stage_type,
+                })
+                rows.append(row)
+
+        df = pd.DataFrame(rows)
+        features, feature_cols, label_col = extract_model_features(df)
+
+        assert STAGE_TYPE_COL in feature_cols
+        assert label_col == 'duration_sum_speedup'
+        assert len(features) == 2
+        assert set(features[STAGE_TYPE_COL]) == {STAGE_TYPE_INPUT_SCAN, STAGE_TYPE_NO_INPUT_SCAN}
+        assert all(features[label_col] == 2.0)
+
+        monkeypatch.setenv('QUALX_LABEL', 'Duration')
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'false')
+        get_config(reload=True)
 
     def test_train_with_sample_weight(self, monkeypatch) -> None:
         """Test training models with different sample weights"""

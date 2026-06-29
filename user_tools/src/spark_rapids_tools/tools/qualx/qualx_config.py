@@ -59,6 +59,14 @@ class QualxConfig(BaseConfig):
         ),
         examples=['Duration', 'duration_sum'])
 
+    duration_sum_stage_type: bool = Field(
+        default=False,
+        description=(
+            'When label is duration_sum, model input rows are split by stage type: '
+            '0 for stages with input scan and 1 for stages without input scan.'
+        ),
+        examples=[False])
+
     split_functions: Union[dict, str] = Field(
         description='Path to split function, or dictionary of path and args',
         examples=[{
@@ -121,6 +129,13 @@ class QualxConfig(BaseConfig):
                     f"QUALX_LABEL environment variable must be either 'Duration' or 'duration_sum', got '{env_label}'"
                 )
             self.label = env_label
+
+        env_stage_type = os.environ.get('QUALX_DURATION_SUM_STAGE_TYPE')
+        if env_stage_type:
+            self.duration_sum_stage_type = env_stage_type.lower() in ['1', 'true', 'yes', 'y', 'on']
+
+        if self.duration_sum_stage_type and self.label != 'duration_sum':
+            raise ValueError("duration_sum_stage_type can only be enabled when label is 'duration_sum'")
 
         return self
 

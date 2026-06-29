@@ -30,6 +30,7 @@ featurizers:
 modifiers:
   - align_sql_id.py
 label: duration_sum
+#duration_sum_stage_type: false
 split_functions:
   train:
     path: split_stratified.py

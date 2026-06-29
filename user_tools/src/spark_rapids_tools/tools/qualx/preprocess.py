@@ -25,7 +25,8 @@ import re
 import pandas as pd
 
 from spark_rapids_tools.api_v1 import ProfWrapper
-from spark_rapids_tools.tools.qualx.config import get_config
+from spark_rapids_tools.tools.qualx.config import get_config, is_duration_sum_stage_type_enabled
+from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
 from spark_rapids_tools.tools.qualx.util import (
     ensure_directory,
     find_eventlogs,
@@ -119,7 +120,10 @@ def get_modifiers(reload: bool = False) -> List[Callable[[pd.DataFrame], pd.Data
 def expected_raw_features() -> Set[str]:
     """Get set of expected raw features from all featurizers."""
     featurizers = get_featurizers()
-    return set(chain(*[f.expected_raw_features for f in featurizers]))
+    expected_features = set(chain(*[f.expected_raw_features for f in featurizers]))
+    if not is_duration_sum_stage_type_enabled():
+        expected_features.discard(STAGE_TYPE_COL)
+    return expected_features
 
 
 def load_datasets(
@@ -364,10 +368,14 @@ def load_profiles(
                 # first featurizer, use as is
                 raw_features = features
             else:
-                # otherwise merge on appId and sqlID
-                raw_features = raw_features.merge(
-                    features, on=['appId', 'sqlID'], how='left'
-                )
+                merge_cols = ['appId', 'sqlID']
+                if (
+                    is_duration_sum_stage_type_enabled()
+                    and STAGE_TYPE_COL in raw_features.columns
+                    and STAGE_TYPE_COL in features.columns
+                ):
+                    merge_cols.append(STAGE_TYPE_COL)
+                raw_features = raw_features.merge(features, on=merge_cols, how='left')
 
         # skip if no raw features
         if raw_features.empty:

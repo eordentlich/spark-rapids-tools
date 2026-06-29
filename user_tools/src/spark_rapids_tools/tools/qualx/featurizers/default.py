@@ -19,10 +19,21 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from spark_rapids_tools.tools.qualx.config import get_label
+from spark_rapids_tools.tools.qualx.config import get_label, is_duration_sum_stage_type_enabled
+from spark_rapids_tools.tools.qualx.stage_type import (
+    SCAN_NODE_PATTERN,
+    STAGE_TYPE_COL,
+    STAGE_TYPE_INPUT_SCAN,
+    STAGE_TYPE_NO_INPUT_SCAN,
+    STAGE_TYPE_VALUES,
+)
 from spark_rapids_tools.tools.qualx.util import log_fallback, get_logger
 
 logger = get_logger(__name__)
+
+STAGE_TYPE_ROLLUP_REL_TOLERANCE = 0.001
+STAGE_TYPE_ROLLUP_ABS_TOLERANCE = 1e-6
+STAGE_TYPE_ROLLUP_SAMPLE_ROWS = 20
 
 
 # expected features for the dataframe produced by preprocessing
@@ -87,6 +98,7 @@ expected_raw_features = {
     'sparkRuntime',  # application_information
     'sparkVersion',  # application_information
     'sqlID',  # job_level_aggregated_task_metrics
+    'stageType',  # N/A (0 for input-scan stages, 1 for non-input-scan stages)
     'sqlOp_AQEShuffleRead',  # sql_plan_metrics_for_application (nodeName)
     'sqlOp_BatchEvalPython',  # sql_plan_metrics_for_application (nodeName)
     'sqlOp_BroadcastExchange',  # sql_plan_metrics_for_application (nodeName)
@@ -162,6 +174,208 @@ expected_raw_features = {
 }
 
 
+def _stage_type_group_cols() -> list:
+    """Return the extra group-by key for stage-type models."""
+    return [STAGE_TYPE_COL] if is_duration_sum_stage_type_enabled() else []
+
+
+def _warn_stage_type_rollup_mismatches(
+    source_tbl: pd.DataFrame,
+    stage_type_tbl: pd.DataFrame,
+    reduce_cols: Dict[str, str],
+    rel_tolerance: float = STAGE_TYPE_ROLLUP_REL_TOLERANCE,
+    abs_tolerance: float = STAGE_TYPE_ROLLUP_ABS_TOLERANCE,
+) -> None:
+    """Warn if additive stageType metrics do not roll up to SQLID-level metrics."""
+    key_cols = ['appId', 'appName', 'sqlID']
+    metric_cols = [
+        col for col, reducer in reduce_cols.items()
+        if reducer == 'sum' and col in source_tbl.columns and col in stage_type_tbl.columns
+    ]
+    if source_tbl.empty or stage_type_tbl.empty or not metric_cols:
+        return
+
+    expected_tbl = source_tbl.groupby(key_cols, as_index=False)[metric_cols].sum()
+    actual_tbl = stage_type_tbl.groupby(key_cols, as_index=False)[metric_cols].sum()
+    compare_tbl = expected_tbl.merge(
+        actual_tbl,
+        on=key_cols,
+        how='outer',
+        suffixes=('_expected', '_stageType'),
+    ).fillna(0)
+
+    mismatch_samples = []
+    mismatch_count = 0
+    mismatch_metrics = set()
+    for metric_col in metric_cols:
+        expected_col = f'{metric_col}_expected'
+        actual_col = f'{metric_col}_stageType'
+        abs_diff = (compare_tbl[actual_col] - compare_tbl[expected_col]).abs()
+        allowed_diff = np.maximum(compare_tbl[expected_col].abs() * rel_tolerance, abs_tolerance)
+        mismatch_mask = abs_diff > allowed_diff
+        if not mismatch_mask.any():
+            continue
+
+        mismatch_count += int(mismatch_mask.sum())
+        mismatch_metrics.add(metric_col)
+        sample_tbl = compare_tbl.loc[
+            mismatch_mask,
+            key_cols + [expected_col, actual_col],
+        ].copy()
+        sample_tbl.insert(0, 'metric', metric_col)
+        sample_tbl['absDiff'] = abs_diff.loc[mismatch_mask].values
+        sample_tbl['relDiffPct'] = np.where(
+            sample_tbl[expected_col].abs() > 0,
+            100.0 * sample_tbl['absDiff'] / sample_tbl[expected_col].abs(),
+            np.inf,
+        )
+        sample_tbl = sample_tbl.rename(
+            columns={
+                expected_col: 'sqlIdValue',
+                actual_col: 'stageTypeRollupValue',
+            }
+        )
+        mismatch_samples.append(sample_tbl)
+
+    if not mismatch_samples:
+        return
+
+    sample_tbl = pd.concat(mismatch_samples, ignore_index=True).head(STAGE_TYPE_ROLLUP_SAMPLE_ROWS)
+    logger.warning(
+        'StageType rollup mismatch for %s SQLID/metric rows across %s additive metrics '
+        '(relative tolerance %.3f%%, absolute tolerance %s). Sample:\n%s',
+        mismatch_count,
+        len(mismatch_metrics),
+        rel_tolerance * 100.0,
+        abs_tolerance,
+        sample_tbl.to_string(index=False),
+    )
+
+
+def _explode_stage_ids(df: pd.DataFrame, stage_col: str = 'stageIds') -> pd.DataFrame:
+    """Explode a comma-delimited stageIds column into an integer stageId column."""
+    if df.empty or stage_col not in df.columns:
+        return pd.DataFrame(columns=list(df.columns) + ['stageId'])
+    exploded = df.copy()
+    exploded[stage_col] = exploded[stage_col].apply(lambda x: str(x).split(','))
+    exploded = exploded.explode(stage_col)
+    exploded[stage_col] = pd.to_numeric(exploded[stage_col], errors='coerce')
+    exploded = exploded.loc[exploded[stage_col].notna()].copy()
+    exploded['stageId'] = exploded[stage_col].astype(int)
+    return exploded
+
+
+def _input_scan_stages_from_plan_metrics(sql_ops_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Return stage IDs whose SQL plan metrics contain an input scan node."""
+    if sql_ops_metrics.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+    scan_ops = sql_ops_metrics.loc[
+        sql_ops_metrics['nodeName'].astype(str).str.strip().str.contains(SCAN_NODE_PATTERN, regex=True, na=False)
+    ]
+    scan_ops = _explode_stage_ids(scan_ops[['appId', 'sqlID', 'stageIds']].drop_duplicates())
+    if scan_ops.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+    return scan_ops[['appId', 'sqlID', 'stageId']].drop_duplicates()
+
+
+def _input_scan_stages_from_sql_to_stage(sql_to_stage: pd.DataFrame, app_id: str) -> pd.DataFrame:
+    """Fallback scan-stage classifier based on SQL node names in sql_to_stage_information."""
+    if sql_to_stage.empty or 'SQL Nodes(IDs)' not in sql_to_stage.columns:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+    scan_stages = sql_to_stage.loc[
+        sql_to_stage['SQL Nodes(IDs)'].astype(str).str.contains(SCAN_NODE_PATTERN, regex=True, na=False)
+    ].copy()
+    if scan_stages.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+    scan_stages['appId'] = app_id
+    return scan_stages[['appId', 'sqlID', 'stageId']].drop_duplicates()
+
+
+def _input_scan_stages_from_stage_metrics(
+    stage_metrics: pd.DataFrame,
+    sql_to_stage: pd.DataFrame,
+    app_id: str,
+) -> pd.DataFrame:
+    """Return stages with stage-level scan-time metrics."""
+    if (
+        stage_metrics.empty
+        or sql_to_stage.empty
+        or 'stageId' not in stage_metrics.columns
+        or 'name' not in stage_metrics.columns
+    ):
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+
+    scan_metric_stages = stage_metrics.loc[
+        stage_metrics['name'].astype(str).str.strip().str.lower().eq('scan time'),
+        ['stageId'],
+    ].dropna().drop_duplicates()
+    if scan_metric_stages.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+
+    scan_metric_stages['stageId'] = scan_metric_stages['stageId'].astype(int)
+    scan_stages = scan_metric_stages.merge(
+        sql_to_stage[['sqlID', 'stageId']].dropna().drop_duplicates(),
+        on='stageId',
+        how='inner',
+    )
+    if scan_stages.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId'])
+
+    scan_stages['appId'] = app_id
+    return scan_stages[['appId', 'sqlID', 'stageId']].drop_duplicates()
+
+
+def _build_stage_type_map(
+    sql_ops_metrics: pd.DataFrame,
+    sql_to_stage: pd.DataFrame,
+    app_id: str,
+    stage_metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build a per-stage map: 0 for input-scan stages, 1 for non-input-scan stages."""
+    if not is_duration_sum_stage_type_enabled() or sql_to_stage.empty:
+        return pd.DataFrame(columns=['appId', 'sqlID', 'stageId', STAGE_TYPE_COL])
+
+    stage_types = sql_to_stage[['sqlID', 'stageId']].dropna().copy()
+    stage_types['appId'] = app_id
+    stage_types['sqlID'] = stage_types['sqlID'].astype(int)
+    stage_types['stageId'] = stage_types['stageId'].astype(int)
+
+    scan_stages = pd.concat(
+        [
+            _input_scan_stages_from_stage_metrics(stage_metrics, sql_to_stage, app_id),
+            _input_scan_stages_from_plan_metrics(sql_ops_metrics),
+            _input_scan_stages_from_sql_to_stage(sql_to_stage, app_id),
+        ],
+        ignore_index=True,
+    ).drop_duplicates()
+
+    scan_stages = scan_stages.copy()
+    if not scan_stages.empty:
+        scan_stages['appId'] = scan_stages['appId'].astype(str)
+        scan_stages['sqlID'] = scan_stages['sqlID'].astype(int)
+        scan_stages['stageId'] = scan_stages['stageId'].astype(int)
+    scan_stages[STAGE_TYPE_COL] = STAGE_TYPE_INPUT_SCAN
+
+    stage_types = stage_types.merge(
+        scan_stages[['appId', 'sqlID', 'stageId', STAGE_TYPE_COL]],
+        on=['appId', 'sqlID', 'stageId'],
+        how='left',
+    )
+    stage_types[STAGE_TYPE_COL] = stage_types[STAGE_TYPE_COL].fillna(STAGE_TYPE_NO_INPUT_SCAN).astype(int)
+    return stage_types.drop_duplicates()
+
+
+def _with_stage_types(df: pd.DataFrame, stage_type_map: pd.DataFrame) -> pd.DataFrame:
+    """Attach stageType to a dataframe that has appId, sqlID, and stageId columns."""
+    if not is_duration_sum_stage_type_enabled() or df.empty:
+        return df
+    if 'stageId' not in df.columns:
+        return df
+    merged = df.merge(stage_type_map, on=['appId', 'sqlID', 'stageId'], how='left')
+    merged[STAGE_TYPE_COL] = merged[STAGE_TYPE_COL].fillna(STAGE_TYPE_NO_INPUT_SCAN).astype(int)
+    return merged
+
+
 def extract_raw_features(
     toc: pd.DataFrame,
     node_level_supp: Optional[pd.DataFrame],
@@ -210,6 +424,7 @@ def extract_raw_features(
 
     # job_map_tbl = combine_tables('job_map_tbl')
     job_stage_agg_tbl = combine_tables('job_stage_agg_tbl')
+    stage_type_map = combine_tables('stage_type_map') if is_duration_sum_stage_type_enabled() else pd.DataFrame()
     whole_stage_tbl = combine_tables('wholestage_tbl')
     # feature tables that must be non-empty
     features_tables = [
@@ -254,10 +469,28 @@ def extract_raw_features(
     except Exception:  # pylint: disable=broad-except
         whole_stage_tbl_filter = pd.DataFrame()
 
+    stage_group_cols = _stage_type_group_cols()
+
+    if is_duration_sum_stage_type_enabled():
+        node_stage_types = _with_stage_types(
+            _explode_stage_ids(ops_tbl[['appId', 'sqlID', 'nodeID', 'stageIds']].drop_duplicates()),
+            stage_type_map,
+        )
+        node_stage_types = node_stage_types[['appId', 'sqlID', 'nodeID', STAGE_TYPE_COL]].drop_duplicates()
+        if not whole_stage_tbl_filter.empty:
+            whole_stage_tbl_filter = whole_stage_tbl_filter.merge(
+                node_stage_types, on=['appId', 'sqlID', 'nodeID'], how='left'
+            )
+            whole_stage_tbl_filter[STAGE_TYPE_COL] = (
+                whole_stage_tbl_filter[STAGE_TYPE_COL].fillna(STAGE_TYPE_NO_INPUT_SCAN).astype(int)
+            )
+
     # remove WholeStageCodegen from original ops table and replace with constituent ops
     ops_tbl_filter = ops_tbl[ops_tbl['nodeName'] != 'WholeStageCodegen']
+    if is_duration_sum_stage_type_enabled():
+        ops_tbl_filter = _with_stage_types(_explode_stage_ids(ops_tbl_filter), stage_type_map)
     ops_tbl_filter = (
-        ops_tbl_filter.groupby(['appId', 'sqlID', 'nodeID'])['nodeName']
+        ops_tbl_filter.groupby(['appId', 'sqlID', *stage_group_cols, 'nodeID'])['nodeName']
         .first()
         .reset_index()
     )
@@ -293,7 +526,7 @@ def extract_raw_features(
     sql_ops_counter = (
         pd.pivot_table(
             sql_ops_counter,
-            index=['appId', 'sqlID'],
+            index=['appId', 'sqlID', *stage_group_cols],
             values='counter',
             columns='nodeName',
         )
@@ -308,6 +541,8 @@ def extract_raw_features(
         for cc in job_stage_agg_tbl.columns
         if cc.split('_')[-1] in ['sum', 'min', 'max', 'mean']
     }
+    if is_duration_sum_stage_type_enabled():
+        job_stage_reduce_cols['Duration'] = 'sum'
 
     if node_level_supp is not None and (qualtool_filter == 'stage'):
         # if supported exec info supplied aggregate features only over supported stages
@@ -317,15 +552,31 @@ def extract_raw_features(
             return pd.DataFrame(columns=list(expected_raw_features))
 
     # aggregate using reduce ops, recomputing duration_mean
-    sql_job_agg_tbl = job_stage_agg_tbl.groupby(
-        ['appId', 'appName', 'sqlID'], as_index=False
-    ).agg(job_stage_reduce_cols)
+    job_stage_group_cols = ['appId', 'appName', 'sqlID', *stage_group_cols]
+    sql_job_agg_tbl = job_stage_agg_tbl.groupby(job_stage_group_cols, as_index=False).agg(job_stage_reduce_cols)
+    if is_duration_sum_stage_type_enabled():
+        stage_types = pd.DataFrame({STAGE_TYPE_COL: STAGE_TYPE_VALUES})
+        sql_stage_keys = (
+            sql_job_agg_tbl[['appId', 'appName', 'sqlID']]
+            .drop_duplicates()
+            .merge(stage_types, how='cross')
+        )
+        sql_job_agg_tbl = sql_stage_keys.merge(sql_job_agg_tbl, on=job_stage_group_cols, how='left')
+        sql_job_agg_tbl[list(job_stage_reduce_cols.keys())] = (
+            sql_job_agg_tbl[list(job_stage_reduce_cols.keys())].replace([np.inf, -np.inf], 0).fillna(0)
+        )
+        _warn_stage_type_rollup_mismatches(
+            job_stage_agg_tbl,
+            sql_job_agg_tbl,
+            job_stage_reduce_cols,
+        )
     sql_job_agg_tbl['duration_mean'] = (
         sql_job_agg_tbl['duration_sum'] / sql_job_agg_tbl['numTasks_sum']
     )
+    sql_job_agg_tbl['duration_mean'] = sql_job_agg_tbl['duration_mean'].replace([np.inf, -np.inf], 0).fillna(0)
 
     sql_job_agg_tbl = sql_job_agg_tbl.merge(
-        sql_ops_counter, on=['appId', 'sqlID'], how='left'
+        sql_ops_counter, on=['appId', 'sqlID', *stage_group_cols], how='left'
     )
 
     # merge app attributes
@@ -333,7 +584,6 @@ def extract_raw_features(
         'appId',
         'appDuration',
         'sqlID',
-        'Duration',
         'description',
         'sparkRuntime',
         'sparkVersion',
@@ -350,6 +600,8 @@ def extract_raw_features(
         'taskCpu',
         'taskGpu',
     ]
+    if not is_duration_sum_stage_type_enabled():
+        app_cols.append('Duration')
 
     sql_job_agg_tbl['appId'] = sql_job_agg_tbl['appId'].str.strip()
     app_tbl['appId'] = app_tbl['appId'].str.strip()
@@ -368,7 +620,7 @@ def extract_raw_features(
 
     # add failed tasks features
     failed_tasks_tbl = combine_tables('failed_tasks_tbl')
-    full_tbl = full_tbl.merge(failed_tasks_tbl, on=['appName', 'appId', 'sqlID'], how='left')
+    full_tbl = full_tbl.merge(failed_tasks_tbl, on=['appName', 'appId', 'sqlID', *stage_group_cols], how='left')
     full_tbl['failed_tasks_ratio'] = full_tbl['failed_tasks'] / full_tbl['numTasks_sum']
     full_tbl.fillna({'failed_tasks': 0, 'failed_tasks_ratio': 0.0}, inplace=True)
 
@@ -381,14 +633,17 @@ def extract_raw_features(
         ((ops_tbl.name == 'cache hits size') | (ops_tbl.name == 'cache misses size'))
     ]
     if not cache_info.empty:
+        if is_duration_sum_stage_type_enabled():
+            cache_info = _with_stage_types(_explode_stage_ids(cache_info), stage_type_map)
+        cache_group_cols = ['appId', 'sqlID', *stage_group_cols, 'name']
         cache_ratio = (
-            cache_info[['appId', 'sqlID', 'name', 'total']]
-            .set_index(['appId', 'sqlID', 'name'])
-            .groupby(['appId', 'sqlID', 'name'])
+            cache_info[[*cache_group_cols, 'total']]
+            .set_index(cache_group_cols)
+            .groupby(cache_group_cols)
             .agg('sum')
         )
         cache_ratio = cache_ratio.reset_index().pivot(
-            index=['appId', 'sqlID'], columns=['name'], values=['total']
+            index=['appId', 'sqlID', *stage_group_cols], columns=['name'], values=['total']
         )
         cache_ratio.columns = cache_ratio.columns.droplevel().values
         cache_ratio['cache_hit_ratio'] = cache_ratio['cache hits size'] / (
@@ -398,7 +653,7 @@ def extract_raw_features(
             cache_ratio['cache hits size'] + cache_ratio['cache misses size']
         )
         cache_ratio = cache_ratio.drop(columns=['cache hits size', 'cache misses size'])
-        full_tbl = full_tbl.merge(cache_ratio, on=['appId', 'sqlID'], how='left')
+        full_tbl = full_tbl.merge(cache_ratio, on=['appId', 'sqlID', *stage_group_cols], how='left')
         full_tbl['input_bytesRead_sum'] = full_tbl[
             ['input_bytesRead_sum', 'input_bytesRead_cache']
         ].max(axis=1)
@@ -411,13 +666,13 @@ def extract_raw_features(
         # if supported info supplied and filtering by supported stage
         # add a column with fraction of total task time supported for each sql ID
         time_ratio = (
-            job_stage_agg_tbl[['appId', 'sqlID', 'Exec Is Supported', 'duration_sum']]
-            .set_index(['appId', 'sqlID', 'Exec Is Supported'])
-            .groupby(['appId', 'sqlID', 'Exec Is Supported'])
+            job_stage_agg_tbl[['appId', 'sqlID', *stage_group_cols, 'Exec Is Supported', 'duration_sum']]
+            .set_index(['appId', 'sqlID', *stage_group_cols, 'Exec Is Supported'])
+            .groupby(['appId', 'sqlID', *stage_group_cols, 'Exec Is Supported'])
             .agg('sum')
         )
         time_ratio = time_ratio.reset_index().pivot(
-            index=['appId', 'sqlID'],
+            index=['appId', 'sqlID', *stage_group_cols],
             columns=['Exec Is Supported'],
             values=['duration_sum'],
         )
@@ -430,25 +685,36 @@ def extract_raw_features(
         time_ratio['fraction_supported'] = time_ratio[True] / (
             time_ratio[False] + time_ratio[True]
         )
+        time_ratio['fraction_supported'] = time_ratio['fraction_supported'].replace([np.inf, -np.inf], 1.0).fillna(1.0)
         time_ratio = time_ratio.drop(columns=[True, False])
-        full_tbl = full_tbl.merge(time_ratio, on=['appId', 'sqlID'], how='inner')
+        full_tbl = full_tbl.merge(time_ratio, on=['appId', 'sqlID', *stage_group_cols], how='left')
+        full_tbl['fraction_supported'] = full_tbl['fraction_supported'].fillna(1.0)
 
     # add data source features
     ds_tbl = combine_tables('ds_tbl')
-    grouped_ds_tbl = ds_tbl.groupby(['appId', 'sqlID'], as_index=False).sum()
-    grouped_ds_tbl['scan_bw'] = (
-        1.0 * grouped_ds_tbl['data_size'] / grouped_ds_tbl['scan_time']
-    )
+    ds_group_cols = ['appId', 'sqlID', *stage_group_cols]
     ds_cols = [
         'appId',
         'sqlID',
+        *stage_group_cols,
         'scan_bw',
         'scan_time',
         'decode_time',
         'data_size',
     ]
+    if is_duration_sum_stage_type_enabled() and not ds_tbl.empty:
+        ds_stage_types = node_stage_types.rename(columns={'nodeID': 'nodeId'})
+        ds_tbl = ds_tbl.merge(ds_stage_types, on=['appId', 'sqlID', 'nodeId'], how='left')
+        ds_tbl[STAGE_TYPE_COL] = ds_tbl[STAGE_TYPE_COL].fillna(STAGE_TYPE_INPUT_SCAN).astype(int)
+    if ds_tbl.empty:
+        grouped_ds_tbl = pd.DataFrame(columns=ds_cols)
+    else:
+        grouped_ds_tbl = ds_tbl.groupby(ds_group_cols, as_index=False).sum()
+        grouped_ds_tbl['scan_bw'] = (
+            1.0 * grouped_ds_tbl['data_size'] / grouped_ds_tbl['scan_time']
+        )
     full_tbl = full_tbl.merge(
-        grouped_ds_tbl[ds_cols], on=['appId', 'sqlID'], how='left'
+        grouped_ds_tbl[ds_cols], on=['appId', 'sqlID', *stage_group_cols], how='left'
     )
 
     # add shuffle bandwidth aggregate features
@@ -510,7 +776,8 @@ def extract_raw_features(
     full_tbl.drop(columns=[cc + '_sum' for cc in time_features], inplace=True)
 
     # impute inf/nan
-    full_tbl[ds_cols] = full_tbl[ds_cols].replace([np.inf, -np.inf], 0).fillna(0)
+    ds_value_cols = ['scan_bw', 'scan_time', 'decode_time', 'data_size']
+    full_tbl[ds_value_cols] = full_tbl[ds_value_cols].replace([np.inf, -np.inf], 0).fillna(0)
 
     # warn if any appIds are missing after preprocessing
     missing_app_ids = list(set(unique_app_ids) - set(full_tbl['appId'].unique()))
@@ -671,10 +938,22 @@ def load_csv_files(
 
     # Update sql_plan_metrics_for_application table:
     sql_ops_metrics = scan_tbl('sql_plan_metrics_for_application')
+    stage_level_all_metrics = scan_tbl('stage_level_all_metrics')
     stages_supp = pd.DataFrame(columns=['appId', 'sqlID', 'stageIds'])
+    stage_type_map = pd.DataFrame(columns=['appId', 'sqlID', 'stageId', STAGE_TYPE_COL])
     if not sql_ops_metrics.empty and not app_info.empty:
         sql_ops_metrics['appId'] = app_info['appId'].iloc[0].strip()
         sql_ops_metrics['appName'] = app_name
+        try:
+            stage_type_map = _build_stage_type_map(
+                sql_ops_metrics,
+                sql_to_stage,
+                app_info['appId'].iloc[0].strip(),
+                stage_level_all_metrics,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.error('Failed to build stage type map for %s. Reason: %s', app_id, ex)
+            raise ScanTblError() from ex
         if node_level_supp is not None:
             if qualtool_filter == 'stage':
                 sql_ops_metrics = sql_ops_metrics.merge(
@@ -796,7 +1075,11 @@ def load_csv_files(
         if remove_failed_sql and sqls_to_drop:
             logger.debug('Ignoring sqlIDs %s due to excessive failed/cancelled stage duration.', sqls_to_drop)
 
-        if node_level_supp is not None and (qualtool_filter == 'stage'):
+        use_stage_level_metrics = (
+            is_duration_sum_stage_type_enabled() or
+            (node_level_supp is not None and (qualtool_filter == 'stage'))
+        )
+        if use_stage_level_metrics:
             job_stage_agg_tbl = job_stage_agg_tbl[
                 job_stage_agg_tbl['js_type'] == 'stage'
             ]
@@ -806,14 +1089,38 @@ def load_csv_files(
                 .astype(int)
             )
             job_stage_agg_tbl['appId'] = job_stage_agg_tbl['appId'].astype(str)
-            # add per stage 'Exec Is Supported' column and also sqlID (stages_supp has this latter info as well)
-            job_stage_agg_tbl = job_stage_agg_tbl.merge(
-                stages_supp,
-                left_on=['appId', 'ID'],
-                right_on=['appId', 'stageIds'],
-                how='inner',
-            )
-            job_stage_agg_tbl = job_stage_agg_tbl.drop(columns=['stageIds'])
+            if node_level_supp is not None and (qualtool_filter == 'stage'):
+                # add per stage 'Exec Is Supported' column and also sqlID
+                job_stage_agg_tbl = job_stage_agg_tbl.merge(
+                    stages_supp,
+                    left_on=['appId', 'ID'],
+                    right_on=['appId', 'stageIds'],
+                    how='inner',
+                )
+                job_stage_agg_tbl = job_stage_agg_tbl.drop(columns=['stageIds'])
+            else:
+                if sql_to_stage.empty:
+                    job_stage_agg_tbl = job_stage_agg_tbl.iloc[0:0].copy()
+                    job_stage_agg_tbl['sqlID'] = pd.Series(dtype=int)
+                else:
+                    stage_sql_map = sql_to_stage[['stageId', 'sqlID']].dropna().drop_duplicates()
+                    job_stage_agg_tbl = job_stage_agg_tbl.merge(
+                        stage_sql_map,
+                        left_on='ID',
+                        right_on='stageId',
+                        how='inner',
+                    )
+
+            if is_duration_sum_stage_type_enabled():
+                job_stage_agg_tbl = job_stage_agg_tbl.merge(
+                    stage_type_map,
+                    left_on=['appId', 'sqlID', 'ID'],
+                    right_on=['appId', 'sqlID', 'stageId'],
+                    how='left',
+                )
+                job_stage_agg_tbl[STAGE_TYPE_COL] = (
+                    job_stage_agg_tbl[STAGE_TYPE_COL].fillna(STAGE_TYPE_NO_INPUT_SCAN).astype(int)
+                )
         else:
             job_stage_agg_tbl = job_stage_agg_tbl[job_stage_agg_tbl['js_type'] == 'job']
 
@@ -827,7 +1134,10 @@ def load_csv_files(
 
         job_stage_agg_tbl['sqlID'] = job_stage_agg_tbl['sqlID'].astype(int)
         job_stage_agg_tbl['hasSqlID'] = job_stage_agg_tbl['sqlID'] != -1
-        job_stage_agg_tbl = job_stage_agg_tbl.drop(columns=['ID', 'js_type'])
+        drop_cols = ['ID', 'js_type']
+        if 'stageId' in job_stage_agg_tbl.columns:
+            drop_cols.append('stageId')
+        job_stage_agg_tbl = job_stage_agg_tbl.drop(columns=drop_cols)
 
     # Load whole stage operator info:
 
@@ -900,11 +1210,21 @@ def load_csv_files(
         # aggregate failed tasks per appName, appId, sqlID
         failed_tasks = failed_tasks.groupby(['appName', 'appId', 'stageId'])['attempt'].count().reset_index()
         failed_tasks = failed_tasks.merge(sql_to_stage[['stageId', 'sqlID']], on=['stageId'])
-        failed_tasks = failed_tasks.groupby(['appName', 'appId', 'sqlID'])['attempt'].sum().reset_index()
+        failed_task_group_cols = ['appName', 'appId', 'sqlID']
+        if is_duration_sum_stage_type_enabled():
+            failed_tasks = failed_tasks.merge(
+                stage_type_map, on=['appId', 'sqlID', 'stageId'], how='left'
+            )
+            failed_tasks[STAGE_TYPE_COL] = failed_tasks[STAGE_TYPE_COL].fillna(STAGE_TYPE_NO_INPUT_SCAN).astype(int)
+            failed_task_group_cols.append(STAGE_TYPE_COL)
+        failed_tasks = failed_tasks.groupby(failed_task_group_cols)['attempt'].sum().reset_index()
         failed_tasks = failed_tasks.rename(columns={'attempt': 'failed_tasks'})
     else:
+        failed_task_cols = ['appName', 'appId', 'sqlID', 'failed_tasks']
+        if is_duration_sum_stage_type_enabled():
+            failed_task_cols.insert(3, STAGE_TYPE_COL)
         failed_tasks = pd.DataFrame(
-            columns=['appName', 'appId', 'sqlID', 'failed_tasks']
+            columns=failed_task_cols
         ).astype({'sqlID': int, 'failed_tasks': int})
 
     # Read data_source_information table
@@ -918,6 +1238,7 @@ def load_csv_files(
         'spark_props_tbl': spark_props,
         'job_map_tbl': job_map_tbl,
         'job_stage_agg_tbl': job_stage_agg_tbl,
+        'stage_type_map': stage_type_map,
         'wholestage_tbl': whole_stage_tbl,
         'ds_tbl': ds_tbl,
         'failed_tasks_tbl': failed_tasks,

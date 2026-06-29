@@ -27,8 +27,9 @@ from xgboost import Booster
 from sklearn.model_selection import train_test_split
 from scipy.optimize import least_squares
 
-from spark_rapids_tools.tools.qualx.config import get_config, get_label
+from spark_rapids_tools.tools.qualx.config import get_config, get_label, is_duration_sum_stage_type_enabled
 from spark_rapids_tools.tools.qualx.preprocess import expected_raw_features
+from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
 from spark_rapids_tools.tools.qualx.util import get_logger
 # Import optional packages
 try:
@@ -353,6 +354,8 @@ def predict(
         'fraction_supported',
         'description',
     ]
+    if is_duration_sum_stage_type_enabled() and STAGE_TYPE_COL in cpu_aug_tbl.columns:
+        select_columns.append(STAGE_TYPE_COL)
     if 'split' in cpu_aug_tbl:
         select_columns.append('split')
 
@@ -424,19 +427,14 @@ def extract_model_features(
                 cpu_aug_tbl.shape[0],
             )
         # train/validation dataset with CPU + GPU runs
-        gpu_aug_tbl = gpu_aug_tbl[
-            [
-                'appName',
-                'scaleFactor',
-                'sqlID',
-                label,
-                'description',
-            ]
-        ]
+        model_keys = ['appName', 'scaleFactor', 'sqlID', 'description']
+        if is_duration_sum_stage_type_enabled():
+            model_keys.append(STAGE_TYPE_COL)
+        gpu_aug_tbl = gpu_aug_tbl[[*model_keys, label]]
         gpu_aug_tbl = gpu_aug_tbl.rename(columns={label: f'xgpu_{label}'})
         cpu_aug_tbl = cpu_aug_tbl.merge(
             gpu_aug_tbl,
-            on=['appName', 'scaleFactor', 'sqlID', 'description'],
+            on=model_keys,
             how='left',
         )
 
@@ -453,8 +451,15 @@ def extract_model_features(
             )
 
         # calculate speedup
-        cpu_aug_tbl[f'{label}_speedup'] = (
-            cpu_aug_tbl[label] / cpu_aug_tbl[f'xgpu_{label}']
+        valid_speedup = (
+            cpu_aug_tbl[label].notna()
+            & cpu_aug_tbl[f'xgpu_{label}'].notna()
+            & (cpu_aug_tbl[label] > 0)
+            & (cpu_aug_tbl[f'xgpu_{label}'] > 0)
+        )
+        cpu_aug_tbl[f'{label}_speedup'] = np.nan
+        cpu_aug_tbl.loc[valid_speedup, f'{label}_speedup'] = (
+            cpu_aug_tbl.loc[valid_speedup, label] / cpu_aug_tbl.loc[valid_speedup, f'xgpu_{label}']
         )
         cpu_aug_tbl = cpu_aug_tbl.drop(columns=[f'xgpu_{label}'])
 

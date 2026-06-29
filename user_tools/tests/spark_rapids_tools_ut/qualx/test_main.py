@@ -21,7 +21,14 @@ from spark_rapids_tools.tools.qualx.qualx_main import (
     _get_model_path,
     _get_model,
     _compute_summary,
+    _roll_up_stage_type_predictions,
     _add_entries_for_missing_apps,
+)
+from spark_rapids_tools.tools.qualx.config import get_config
+from spark_rapids_tools.tools.qualx.stage_type import (
+    STAGE_TYPE_COL,
+    STAGE_TYPE_INPUT_SCAN,
+    STAGE_TYPE_NO_INPUT_SCAN,
 )
 from ..conftest import SparkRapidsToolsUT
 
@@ -116,3 +123,39 @@ class TestMain(SparkRapidsToolsUT):
         assert 'wasPredicted' in result.columns
         assert sum(result['wasPredicted']) == 2  # Two apps were predicted
         assert not result.loc[result['appId'] == 'id3', 'wasPredicted'].iloc[0]  # id3 was not predicted
+
+    def test_roll_up_stage_type_predictions(self, monkeypatch):
+        """Test stageType rows roll up using summed predicted durations."""
+        monkeypatch.setenv('QUALX_LABEL', 'duration_sum')
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'true')
+        get_config(reload=True)
+
+        results = pd.DataFrame({
+            'appName': ['app1', 'app1'],
+            'appId': ['id1', 'id1'],
+            'appDuration': [1000, 1000],
+            'sqlID': [7, 7],
+            'scaleFactor': [1.0, 1.0],
+            'description': ['query', 'query'],
+            STAGE_TYPE_COL: [STAGE_TYPE_INPUT_SCAN, STAGE_TYPE_NO_INPUT_SCAN],
+            'duration_sum': [100, 300],
+            'duration_sum_pred': [50, 100],
+            'duration_sum_supported': [100, 300],
+            'y_pred': [2.0, 3.0],
+        })
+
+        rolled = _roll_up_stage_type_predictions(results)
+        assert len(rolled) == 1
+        assert rolled['duration_sum'].iloc[0] == 400
+        assert rolled['duration_sum_pred'].iloc[0] == 150
+        assert rolled['speedup_pred'].iloc[0] == 400 / 150
+
+        summary = _compute_summary(results)
+        assert summary['duration_sum'].iloc[0] == 400
+        assert summary['duration_sum_pred'].iloc[0] == 150
+        assert summary['appDuration_pred'].iloc[0] == 750
+        assert summary['speedup'].iloc[0] == 1000 / 750
+
+        monkeypatch.setenv('QUALX_LABEL', 'Duration')
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'false')
+        get_config(reload=True)
