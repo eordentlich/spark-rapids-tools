@@ -119,7 +119,14 @@ def get_modifiers(reload: bool = False) -> List[Callable[[pd.DataFrame], pd.Data
 def expected_raw_features() -> Set[str]:
     """Get set of expected raw features from all featurizers."""
     featurizers = get_featurizers()
-    return set(chain(*[f.expected_raw_features for f in featurizers]))
+
+    def _expected_features(featurizer) -> Set[str]:
+        expected_features_fn = getattr(featurizer, 'get_expected_raw_features', None)
+        if callable(expected_features_fn):
+            return set(expected_features_fn())
+        return set(featurizer.expected_raw_features)
+
+    return set(chain(*[_expected_features(f) for f in featurizers]))
 
 
 def load_datasets(

@@ -59,6 +59,14 @@ class QualxConfig(BaseConfig):
         ),
         examples=['Duration', 'duration_sum'])
 
+    include_gpu_max_task_metrics: Optional[bool] = Field(
+        default=False,
+        description=(
+            'OPTIONAL: Include gpuMax* task metrics from '
+            'gpu_sql_level_aggregated_task_metrics.csv.'
+        ),
+        examples=[True, False])
+
     split_functions: Union[dict, str] = Field(
         description='Path to split function, or dictionary of path and args',
         examples=[{
@@ -119,8 +127,24 @@ class QualxConfig(BaseConfig):
             if env_label not in ['Duration', 'duration_sum']:
                 raise ValueError(
                     f"QUALX_LABEL environment variable must be either 'Duration' or 'duration_sum', got '{env_label}'"
-                )
+            )
             self.label = env_label
+
+        # Check for QUALX_INCLUDE_GPU_MAX_TASK_METRICS environment variable
+        env_include_gpu_max = os.environ.get('QUALX_INCLUDE_GPU_MAX_TASK_METRICS')
+        if env_include_gpu_max is not None:
+            normalized = env_include_gpu_max.strip().lower()
+            true_values = {'1', 'true', 't', 'yes', 'y', 'on'}
+            false_values = {'0', 'false', 'f', 'no', 'n', 'off'}
+            if normalized in true_values:
+                self.include_gpu_max_task_metrics = True
+            elif normalized in false_values:
+                self.include_gpu_max_task_metrics = False
+            else:
+                raise ValueError(
+                    'QUALX_INCLUDE_GPU_MAX_TASK_METRICS environment variable must be '
+                    f'a boolean value, got {env_include_gpu_max!r}'
+                )
 
         return self
 

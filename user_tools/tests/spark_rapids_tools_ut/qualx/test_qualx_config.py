@@ -58,6 +58,7 @@ class TestQualxConfig(SparkRapidsToolsUT):
         assert config.cache_dir == 'qualx_cache'
         assert config.label == 'Duration'
         assert config.alignment_dir is None
+        assert config.include_gpu_max_task_metrics is False
 
     def test_environment_variable_overrides(self, monkeypatch, qualx_config_params):
         """Test that environment variables override default values"""
@@ -70,6 +71,18 @@ class TestQualxConfig(SparkRapidsToolsUT):
         monkeypatch.setenv('QUALX_LABEL', 'duration_sum')
         config = QualxConfig(**qualx_config_params)
         assert config.label == 'duration_sum'
+
+        # Test QUALX_INCLUDE_GPU_MAX_TASK_METRICS override
+        monkeypatch.setenv('QUALX_INCLUDE_GPU_MAX_TASK_METRICS', 'true')
+        config = QualxConfig(**qualx_config_params)
+        assert config.include_gpu_max_task_metrics is True
+        monkeypatch.setenv('QUALX_INCLUDE_GPU_MAX_TASK_METRICS', '0')
+        config = QualxConfig(**qualx_config_params)
+        assert config.include_gpu_max_task_metrics is False
+        monkeypatch.setenv('QUALX_INCLUDE_GPU_MAX_TASK_METRICS', 'invalid_bool')
+        with pytest.raises(ValueError):
+            QualxConfig(**qualx_config_params)
+        monkeypatch.delenv('QUALX_INCLUDE_GPU_MAX_TASK_METRICS')
 
         # Test QUALX_LABEL override with invalid value
         monkeypatch.setenv('QUALX_LABEL', 'invalid_label')

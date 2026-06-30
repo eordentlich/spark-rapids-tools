@@ -19,10 +19,21 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from spark_rapids_tools.tools.qualx.config import get_label
+from spark_rapids_tools.tools.qualx.config import get_config, get_label
 from spark_rapids_tools.tools.qualx.util import log_fallback, get_logger
 
 logger = get_logger(__name__)
+
+GPU_MAX_TASK_METRIC_FEATURES = {
+    'gpuMaxConcurrentGpuTasks',
+    'gpuMaxDeviceMemoryBytes',
+    'gpuMaxDiskMemoryBytes',
+    'gpuMaxHostMemoryBytes',
+    'gpuMaxPageableMemoryBytes',
+    'gpuMaxPinnedMemoryBytes',
+    'gpuMaxTaskFootprint',
+}
+GPU_MAX_TASK_METRIC_DEFAULT = -1
 
 
 # expected features for the dataframe produced by preprocessing
@@ -162,6 +173,93 @@ expected_raw_features = {
 }
 
 
+def is_gpu_max_task_metrics_enabled() -> bool:
+    """Return True when gpuMax* task metric feature extraction is enabled."""
+    return bool(get_config().include_gpu_max_task_metrics)
+
+
+def get_expected_raw_features() -> set:
+    """Get expected raw features, including optional gpuMax task metrics."""
+    if is_gpu_max_task_metrics_enabled():
+        return set(expected_raw_features) | GPU_MAX_TASK_METRIC_FEATURES
+    return set(expected_raw_features)
+
+
+def _empty_gpu_max_task_metrics() -> pd.DataFrame:
+    """Return an empty gpuMax task metrics table with the expected schema."""
+    return pd.DataFrame(
+        columns=['appId', 'sqlID'] + sorted(GPU_MAX_TASK_METRIC_FEATURES)
+    )
+
+
+def _load_gpu_max_task_metrics(gpu_sql_metrics: pd.DataFrame, app_id: str) -> pd.DataFrame:
+    """Load gpu_sql_level_aggregated_task_metrics.csv as one row per app/sqlID."""
+    required_cols = {'sqlId', 'metricName', 'max'}
+    if gpu_sql_metrics.empty:
+        return _empty_gpu_max_task_metrics()
+
+    missing_cols = required_cols - set(gpu_sql_metrics.columns)
+    if missing_cols:
+        logger.debug(
+            'Ignoring gpu_sql_level_aggregated_task_metrics for %s, missing columns: %s',
+            app_id,
+            sorted(missing_cols),
+        )
+        return _empty_gpu_max_task_metrics()
+
+    gpu_max_metrics = gpu_sql_metrics.loc[
+        gpu_sql_metrics['metricName'].isin(GPU_MAX_TASK_METRIC_FEATURES),
+        ['sqlId', 'metricName', 'max'],
+    ].copy()
+    if gpu_max_metrics.empty:
+        return _empty_gpu_max_task_metrics()
+
+    gpu_max_metrics['max'] = pd.to_numeric(gpu_max_metrics['max'], errors='coerce')
+    gpu_max_metrics['sqlID'] = pd.to_numeric(gpu_max_metrics['sqlId'], errors='coerce')
+    gpu_max_metrics.dropna(subset=['sqlID'], inplace=True)
+    if gpu_max_metrics.empty:
+        return _empty_gpu_max_task_metrics()
+    gpu_max_metrics['sqlID'] = gpu_max_metrics['sqlID'].astype(int)
+    gpu_max_metrics['appId'] = app_id
+
+    pivoted_metrics = (
+        pd.pivot_table(
+            gpu_max_metrics,
+            index=['appId', 'sqlID'],
+            values='max',
+            columns='metricName',
+            aggfunc='max',
+        )
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    return pivoted_metrics.reindex(
+        columns=['appId', 'sqlID'] + sorted(GPU_MAX_TASK_METRIC_FEATURES)
+    )
+
+
+def _add_gpu_max_task_metrics(
+    full_tbl: pd.DataFrame,
+    gpu_max_task_metrics_tbl: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge optional gpuMax task metrics and fill absent app/sql values with -1."""
+    gpu_max_features = sorted(GPU_MAX_TASK_METRIC_FEATURES)
+    gpu_max_task_metrics_tbl = gpu_max_task_metrics_tbl.reindex(
+        columns=['appId', 'sqlID'] + gpu_max_features
+    )
+    full_tbl = full_tbl.merge(
+        gpu_max_task_metrics_tbl,
+        on=['appId', 'sqlID'],
+        how='left',
+    )
+    full_tbl[gpu_max_features] = (
+        full_tbl[gpu_max_features]
+        .apply(pd.to_numeric, errors='coerce')
+        .fillna(GPU_MAX_TASK_METRIC_DEFAULT)
+    )
+    return full_tbl
+
+
 def extract_raw_features(
     toc: pd.DataFrame,
     node_level_supp: Optional[pd.DataFrame],
@@ -222,7 +320,7 @@ def extract_raw_features(
         empty_tables_str = ', '.join(empty_tables)
         log_fallback(logger, unique_app_ids,
                      fallback_reason=f'Empty feature tables found after preprocessing: {empty_tables_str}')
-        return pd.DataFrame(columns=list(expected_raw_features))
+        return pd.DataFrame(columns=list(get_expected_raw_features()))
 
     if get_label() == 'duration_sum':
         # override appDuration with sum(duration_sum) across all stages per appId
@@ -314,7 +412,7 @@ def extract_raw_features(
         sql_job_agg_tbl = job_stage_agg_tbl.loc[job_stage_agg_tbl['Exec Is Supported']]
         if sql_job_agg_tbl.empty:
             log_fallback(logger, unique_app_ids, fallback_reason='No fully supported stages found')
-            return pd.DataFrame(columns=list(expected_raw_features))
+            return pd.DataFrame(columns=list(get_expected_raw_features()))
 
     # aggregate using reduce ops, recomputing duration_mean
     sql_job_agg_tbl = job_stage_agg_tbl.groupby(
@@ -371,6 +469,10 @@ def extract_raw_features(
     full_tbl = full_tbl.merge(failed_tasks_tbl, on=['appName', 'appId', 'sqlID'], how='left')
     full_tbl['failed_tasks_ratio'] = full_tbl['failed_tasks'] / full_tbl['numTasks_sum']
     full_tbl.fillna({'failed_tasks': 0, 'failed_tasks_ratio': 0.0}, inplace=True)
+
+    if is_gpu_max_task_metrics_enabled():
+        gpu_max_task_metrics_tbl = combine_tables('gpu_max_task_metrics_tbl')
+        full_tbl = _add_gpu_max_task_metrics(full_tbl, gpu_max_task_metrics_tbl)
 
     # impute missing ops and fix dtype
     full_tbl[sql_ops_list] = full_tbl[sql_ops_list].fillna(0).astype(int)
@@ -640,6 +742,14 @@ def load_csv_files(
         sql_duration = sql_duration.drop(columns=['Potential Problems'])
 
     sql_app_metrics = scan_tbl('sql_level_aggregated_task_metrics')
+    if is_gpu_max_task_metrics_enabled():
+        app_info_app_id = str(app_info['appId'].iloc[0]).strip() if not app_info.empty else app_id
+        gpu_max_task_metrics = _load_gpu_max_task_metrics(
+            scan_tbl('gpu_sql_level_aggregated_task_metrics', warn_on_error=False),
+            app_info_app_id,
+        )
+    else:
+        gpu_max_task_metrics = _empty_gpu_max_task_metrics()
 
     # filter out sql ids that have no execs associated with them
     # this should remove root sql ids in 3.4.1+
@@ -922,5 +1032,7 @@ def load_csv_files(
         'ds_tbl': ds_tbl,
         'failed_tasks_tbl': failed_tasks,
     }
+    if is_gpu_max_task_metrics_enabled():
+        out['gpu_max_task_metrics_tbl'] = gpu_max_task_metrics
 
     return out

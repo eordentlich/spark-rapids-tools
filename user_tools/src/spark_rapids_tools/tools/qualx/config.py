@@ -20,6 +20,7 @@ Environment variables:
 - QUALX_DIR: root directory for Qualx execution, primarily used in dataset JSON files to locate
     dataset-specific plugins.
 - QUALX_LABEL: targeted label column for XGBoost model.
+- QUALX_INCLUDE_GPU_MAX_TASK_METRICS: include gpuMax* SQL task metrics from profiler output.
 - SPARK_RAPIDS_TOOLS_JAR: path to Spark RAPIDS Tools JAR file.
 """
 from typing import Type

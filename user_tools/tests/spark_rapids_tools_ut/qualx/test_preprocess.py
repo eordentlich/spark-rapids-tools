@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Test qualx_preprocess module"""
+# pylint: disable=protected-access
 import os
 import json
 import tempfile
@@ -21,6 +22,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from spark_rapids_tools.tools.qualx.config import get_config
+from spark_rapids_tools.tools.qualx.featurizers import default as default_featurizer
 from spark_rapids_tools.tools.qualx.preprocess import (
     expected_raw_features,
     impute,
@@ -59,6 +61,67 @@ class TestPreprocess(SparkRapidsToolsUT):
 
         # all other columns should be 0.0
         assert imputed_df[list(df_columns - {'fraction_supported'})].iloc[0].sum() == 0.0
+
+    def test_gpu_max_task_metrics_pivot(self):
+        # Test gpu_sql_level_aggregated_task_metrics pivot from rows to columns
+        input_df = pd.DataFrame({
+            'sqlId': [1, 1, 1, 2],
+            'metricName': [
+                'gpuMaxDeviceMemoryBytes',
+                'gpuMaxTaskFootprint',
+                'gpuTime',
+                'gpuMaxConcurrentGpuTasks',
+            ],
+            'unit': ['bytes', 'count', 'ms', 'count'],
+            'sum': ['', '', 50, ''],
+            'max': [10, 512, 25, 3],
+            'avg': ['', '', 5, ''],
+        })
+
+        result = default_featurizer._load_gpu_max_task_metrics(input_df, 'app-1')
+
+        assert set(default_featurizer.GPU_MAX_TASK_METRIC_FEATURES).issubset(result.columns)
+        assert 'gpuTime' not in result.columns
+        sql_1 = result.loc[result['sqlID'] == 1].iloc[0]
+        assert sql_1['appId'] == 'app-1'
+        assert sql_1['gpuMaxDeviceMemoryBytes'] == 10
+        assert sql_1['gpuMaxTaskFootprint'] == 512
+        sql_2 = result.loc[result['sqlID'] == 2].iloc[0]
+        assert sql_2['gpuMaxConcurrentGpuTasks'] == 3
+
+    def test_gpu_max_task_metrics_expected_features_are_gated(self):
+        # Test expected feature columns are included only when the config gate is enabled
+        with patch.object(default_featurizer, 'is_gpu_max_task_metrics_enabled', return_value=False):
+            disabled_features = default_featurizer.get_expected_raw_features()
+        with patch.object(default_featurizer, 'is_gpu_max_task_metrics_enabled', return_value=True):
+            enabled_features = default_featurizer.get_expected_raw_features()
+
+        assert 'gpuMaxDeviceMemoryBytes' not in disabled_features
+        assert default_featurizer.GPU_MAX_TASK_METRIC_FEATURES.issubset(enabled_features)
+
+    def test_gpu_max_task_metrics_fill_missing_app_with_negative_one(self):
+        # Test missing gpu_sql_level_aggregated_task_metrics values are injected as -1
+        gpu_max_features = sorted(default_featurizer.GPU_MAX_TASK_METRIC_FEATURES)
+        full_tbl = pd.DataFrame({
+            'appId': ['app-1', 'app-2'],
+            'sqlID': [1, 7],
+            'Duration': [100, 200],
+        })
+        metrics_row = {feature: None for feature in gpu_max_features}
+        metrics_row.update({
+            'appId': 'app-1',
+            'sqlID': 1,
+            'gpuMaxDeviceMemoryBytes': 10,
+        })
+        metrics_tbl = pd.DataFrame([metrics_row], columns=['appId', 'sqlID'] + gpu_max_features)
+
+        result = default_featurizer._add_gpu_max_task_metrics(full_tbl, metrics_tbl)
+
+        app_1 = result.loc[result['appId'] == 'app-1'].iloc[0]
+        app_2 = result.loc[result['appId'] == 'app-2'].iloc[0]
+        assert app_1['gpuMaxDeviceMemoryBytes'] == 10
+        assert app_1['gpuMaxTaskFootprint'] == -1
+        assert app_2[gpu_max_features].eq(-1).all()
 
     def test_get_alignment(self):
         # Test get_alignment function
