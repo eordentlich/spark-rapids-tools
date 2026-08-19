@@ -28,6 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from scipy.stats import kendalltau
 from tabulate import tabulate
 
 from spark_rapids_tools.api_v1 import QualWrapper, QualCore
@@ -45,6 +46,20 @@ def get_logger(name: str) -> logging.Logger:
 
 
 logger = get_logger(__name__)
+
+
+def _compute_kendall_tau(results: pd.DataFrame, y: str, y_pred: str) -> float:
+    """Compute Kendall tau rank correlation for actual vs predicted values."""
+    rank_df = (
+        results[[y, y_pred]]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if len(rank_df) < 2:
+        return np.nan
+
+    tau = kendalltau(rank_df[y], rank_df[y_pred]).statistic
+    return float(tau) if not np.isnan(tau) else np.nan
 
 
 @dataclass
@@ -246,13 +261,14 @@ def compute_accuracy(
     -------
     scores: Dict[str, Dict[str, float]]
         Dictionary of different scoring metrics per prediction column,
-        e.g. {'QXS': {'MAPE"; 1.31, 'dMAPE': 1.25}}
+        e.g. {'QXS': {'MAPE': 1.31, 'dMAPE': 1.25, 'KendallTau': 0.75}}
     """
     scores = {}
     for name, y_pred in y_preds.items():
         scores[name] = {
             'MAPE': np.average(np.abs(results[y] - results[y_pred]) / results[y]),
             'wMAPE': np.sum(np.abs(results[y] - results[y_pred])) / np.sum(results[y]),
+            'KendallTau': _compute_kendall_tau(results, y, y_pred),
         }
         if weight:
             # MAPE w/ custom weighting by duration

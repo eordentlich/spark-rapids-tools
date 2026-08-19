@@ -203,7 +203,7 @@ class TestModel(SparkRapidsToolsUT):
                     'runType': run_type,
                     'scaleFactor': 1,
                     'sqlID': 7,
-                    STAGE_TYPE_COL: stage_type,
+                    STAGE_TYPE_COL: str(stage_type),
                 })
                 rows.append(row)
 
@@ -213,8 +213,17 @@ class TestModel(SparkRapidsToolsUT):
         assert STAGE_TYPE_COL in feature_cols
         assert label_col == 'duration_sum_speedup'
         assert len(features) == 2
+        assert pd.api.types.is_integer_dtype(features[STAGE_TYPE_COL])
         assert set(features[STAGE_TYPE_COL]) == {STAGE_TYPE_INPUT_SCAN, STAGE_TYPE_NO_INPUT_SCAN}
         assert all(features[label_col] == 2.0)
+
+        def inconsistent_split(stage_type_df):
+            result = stage_type_df.copy()
+            result['split'] = result[STAGE_TYPE_COL].astype(str).map({'0': 'train', '1': 'val'})
+            return result
+
+        with pytest.raises(ValueError, match='inconsistent split assignments'):
+            extract_model_features(df, split_functions={'default': inconsistent_split})
 
         monkeypatch.setenv('QUALX_LABEL', 'Duration')
         monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'false')

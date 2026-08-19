@@ -145,6 +145,24 @@ class TestSplitFunctions(SparkRapidsToolsUT):
         result2 = split_train_val(sample_dataframe, seed=1234)
         assert not result1['split'].equals(result2['split'])
 
+    def test_split_train_val_keeps_stage_types_together_and_stable(self):
+        """StageType rows for a SQL should retain their split when other SQL records are absent."""
+        features = pd.DataFrame({
+            'appId': [f'app{i}' for i in range(100) for _ in range(2)],
+            'sqlID': [i for i in range(100) for _ in range(2)],
+            'stageType': [stage_type for _ in range(100) for stage_type in [0, 1]],
+        })
+
+        full = split_train_val(features.copy(), seed=42)
+        filtered = split_train_val(features.loc[features.appId != 'app0'].copy(), seed=42)
+
+        assert full.groupby(['appId', 'sqlID'])['split'].nunique().max() == 1
+        common = full.loc[full.appId != 'app0', ['appId', 'sqlID', 'stageType', 'split']]
+        pd.testing.assert_series_equal(
+            common.reset_index(drop=True)['split'],
+            filtered.reset_index(drop=True)['split'],
+        )
+
     def test_split_stratified_reproducibility(self, sample_dataframe):
         """Test that stratified split produces same results with same seed."""
         sample1 = sample_dataframe.copy()

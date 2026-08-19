@@ -29,7 +29,13 @@ from spark_rapids_tools.tools.qualx.preprocess import (
     get_modifiers,
     infer_app_meta,
     load_qtool_execs,
-    load_datasets
+    load_datasets,
+    load_profiles
+)
+from spark_rapids_tools.tools.qualx.stage_type import (
+    STAGE_TYPE_COL,
+    STAGE_TYPE_INPUT_SCAN,
+    STAGE_TYPE_NO_INPUT_SCAN,
 )
 from ..conftest import SparkRapidsToolsUT
 
@@ -204,6 +210,71 @@ class TestPreprocess(SparkRapidsToolsUT):
         assert list(result.columns) == ['App ID', 'SQL ID', 'SQL Node Id', 'Exec Is Supported']
         assert len(result) == 4
         assert result['Exec Is Supported'].tolist() == [True, True, True, False]
+
+    def test_load_profiles_normalizes_stage_type_dtype(self, monkeypatch):
+        """load_profiles should return numeric stageType even if a featurizer returns object dtype."""
+        monkeypatch.setenv('QUALX_LABEL', 'duration_sum')
+        monkeypatch.setenv('QUALX_DURATION_SUM_STAGE_TYPE', 'true')
+        get_config(reload=True)
+
+        class FakeFeaturizer:
+            __name__ = 'FakeFeaturizer'
+            expected_raw_features = {
+                'appId',
+                'appName',
+                'platform_onprem',
+                'runType',
+                'scaleFactor',
+                'sqlID',
+                STAGE_TYPE_COL,
+            }
+
+            @staticmethod
+            def extract_raw_features(*_args, **_kwargs):
+                return pd.DataFrame({
+                    'appId': ['app-1', 'app-1'],
+                    'appName': ['dataset1', 'dataset1'],
+                    'sqlID': [1, 1],
+                    STAGE_TYPE_COL: pd.Series(
+                        [str(STAGE_TYPE_INPUT_SCAN), str(STAGE_TYPE_NO_INPUT_SCAN)],
+                        dtype=object,
+                    ),
+                })
+
+        monkeypatch.setattr(
+            'spark_rapids_tools.tools.qualx.preprocess.get_featurizers',
+            lambda: [FakeFeaturizer],
+        )
+        monkeypatch.setattr(
+            'spark_rapids_tools.tools.qualx.preprocess.get_modifiers',
+            lambda: [],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, 'app-1')
+            os.makedirs(app_dir)
+            with open(os.path.join(app_dir, 'application_information.csv'), 'w', encoding='utf-8') as file:
+                file.write('dummy\n')
+
+            profile_df = load_profiles(
+                {
+                    'dataset1': {
+                        'profiles': [temp_dir],
+                        'platform': 'onprem',
+                        'app_meta': {
+                            'app-1': {
+                                'runType': 'CPU',
+                                'scaleFactor': 1,
+                            },
+                        },
+                    },
+                }
+            )
+
+        assert pd.api.types.is_integer_dtype(profile_df[STAGE_TYPE_COL])
+        assert profile_df[STAGE_TYPE_COL].tolist() == [
+            STAGE_TYPE_INPUT_SCAN,
+            STAGE_TYPE_NO_INPUT_SCAN,
+        ]
 
     def test_load_datasets(self):
         """Test load_datasets function"""

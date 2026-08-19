@@ -29,7 +29,11 @@ from scipy.optimize import least_squares
 
 from spark_rapids_tools.tools.qualx.config import get_config, get_label, is_duration_sum_stage_type_enabled
 from spark_rapids_tools.tools.qualx.preprocess import expected_raw_features
-from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
+from spark_rapids_tools.tools.qualx.stage_type import (
+    STAGE_TYPE_COL,
+    normalize_stage_type_column,
+    validate_stage_type_splits,
+)
 from spark_rapids_tools.tools.qualx.util import get_logger
 # Import optional packages
 try:
@@ -400,6 +404,8 @@ def extract_model_features(
     missing = expected_raw_features() - set(df.columns)
     if missing:
         logger.warning('Input dataframe is missing expected raw features: %s', missing)
+    if is_duration_sum_stage_type_enabled() and STAGE_TYPE_COL in df.columns:
+        df = normalize_stage_type_column(df, context='model input dataframe')
 
     if FILTER_SPILLS:
         df = df[
@@ -513,7 +519,7 @@ def extract_model_features(
             modified_df = split_fn(dataset_df)
             if modified_df.index.equals(dataset_df.index):
                 cpu_aug_tbl.update(modified_df)
-                cpu_aug_tbl.astype(df_schema)
+                cpu_aug_tbl = cpu_aug_tbl.astype(df_schema.to_dict())
             else:
                 raise ValueError(f'Plugin: split_function for {ds_name} unexpectedly modified row indices.')
             cpu_aug_tbl.update(dataset_df)
@@ -526,9 +532,12 @@ def extract_model_features(
             modified_default_df = default_split_fn(default_df)
             if modified_default_df.index.equals(default_df.index):
                 cpu_aug_tbl.update(modified_default_df)
-                cpu_aug_tbl.astype(df_schema)
+                cpu_aug_tbl = cpu_aug_tbl.astype(df_schema.to_dict())
             else:
                 raise ValueError('Default split_function unexpectedly modified row indices.')
+    if is_duration_sum_stage_type_enabled() and STAGE_TYPE_COL in cpu_aug_tbl.columns:
+        cpu_aug_tbl = normalize_stage_type_column(cpu_aug_tbl, context='model feature dataframe')
+        validate_stage_type_splits(cpu_aug_tbl, context='model feature dataframe')
     return cpu_aug_tbl, feature_cols, label_col
 
 

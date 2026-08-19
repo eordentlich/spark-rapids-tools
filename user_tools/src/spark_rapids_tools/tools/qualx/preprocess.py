@@ -26,7 +26,7 @@ import pandas as pd
 
 from spark_rapids_tools.api_v1 import ProfWrapper
 from spark_rapids_tools.tools.qualx.config import get_config, is_duration_sum_stage_type_enabled
-from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
+from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL, normalize_stage_type_column
 from spark_rapids_tools.tools.qualx.util import (
     ensure_directory,
     find_eventlogs,
@@ -188,6 +188,11 @@ def load_datasets(
                     profile_df['appName_base'].isin(dataset_keys)
                 ]
                 profile_df.drop(columns='appName_base', inplace=True)
+            if is_duration_sum_stage_type_enabled():
+                profile_df = normalize_stage_type_column(
+                    profile_df,
+                    context=f'cached profile_df for platform {platform}',
+                )
         else:
             # otherwise, check for cached profiler output
             profile_dir = f'{platform_cache}/profile'
@@ -212,6 +217,8 @@ def load_datasets(
         profile_dfs.append(profile_df)
 
     profile_df = pd.concat(profile_dfs)
+    if is_duration_sum_stage_type_enabled():
+        profile_df = normalize_stage_type_column(profile_df, context='combined profile_df')
 
     # sanity check
     if ds_count != len(all_datasets):
@@ -279,6 +286,7 @@ def load_profiles(
             profile_paths = ds_meta['profiles']
             app_meta = ds_meta['app_meta']
         elif profile_dir is not None:
+            print(f"profile_dir: {profile_dir}")
             # during training/evaluation, we expect profile_dir to point to the qualx_cache
             profile_paths = ProfWrapper.find_report_paths(f'{profile_dir}/{ds_name}')
             # get app_meta, or infer from directory structure of eventlogs
@@ -416,7 +424,7 @@ def load_profiles(
                 modified_dataset_df = plugin.load_profiles_hook(dataset_df)
                 if modified_dataset_df.index.equals(dataset_df.index):
                     profile_df.update(modified_dataset_df)
-                    profile_df.astype(df_schema)
+                    profile_df = profile_df.astype(df_schema.to_dict())
                 else:
                     raise ValueError(
                         f'Plugin: load_profiles_hook for {ds_name} unexpectedly modified row indices.'
@@ -428,11 +436,14 @@ def load_profiles(
             modified_df = modifier.modify(profile_df, config=config, alignment_df=alignment_df)
             if modified_df.index.equals(profile_df.index):
                 profile_df.update(modified_df)
-                profile_df.astype(df_schema)
+                profile_df = profile_df.astype(df_schema.to_dict())
             else:
                 raise ValueError(
                     f'Modifier: {modifier.__name__} unexpectedly modified row indices.'
                 )
+
+        if is_duration_sum_stage_type_enabled():
+            profile_df = normalize_stage_type_column(profile_df, context='profile_df')
 
     return profile_df
 

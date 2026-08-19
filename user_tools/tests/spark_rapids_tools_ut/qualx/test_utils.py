@@ -98,15 +98,24 @@ class TestUtils(SparkRapidsToolsUT):
             'label': [1, 2, 3],
             'pred1': [1, 3, 2],
             'pred2': [2, 1, 3],
+            'pred3': [3, 2, 1],
             'weight': [1, 2, 3],
         })
-        result = compute_accuracy(data, 'label', {'Pred1': 'pred1', 'Pred2': 'pred2'}, 'weight')
+        result = compute_accuracy(
+            data,
+            'label',
+            {'Pred1': 'pred1', 'Pred2': 'pred2', 'Pred3': 'pred3'},
+            'weight',
+        )
         assert result['Pred1']['MAPE'] == pytest.approx(5/18)
         assert result['Pred1']['wMAPE'] == pytest.approx(1/3)
         assert result['Pred1']['dMAPE'] == pytest.approx(1/3)
+        assert result['Pred1']['KendallTau'] == pytest.approx(1/3)
         assert result['Pred2']['MAPE'] == pytest.approx(0.5)
         assert result['Pred2']['wMAPE'] == pytest.approx(1/3)
         assert result['Pred2']['dMAPE'] == pytest.approx(1/3)
+        assert result['Pred2']['KendallTau'] == pytest.approx(1/3)
+        assert result['Pred3']['KendallTau'] == pytest.approx(-1.0)
 
     def test_compute_precision_recall(self):
         data = pd.DataFrame({

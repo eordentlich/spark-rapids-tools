@@ -14,6 +14,7 @@
 
 """ Main module for QualX related commands """
 
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Set, Tuple, Union, Dict
 import glob
 import json
@@ -38,7 +39,11 @@ from spark_rapids_tools.tools.qualx.config import (
     get_label,
     is_duration_sum_stage_type_enabled,
 )
-from spark_rapids_tools.tools.qualx.stage_type import STAGE_TYPE_COL
+from spark_rapids_tools.tools.qualx.stage_type import (
+    STAGE_TYPE_COL,
+    STAGE_TYPE_VALUES,
+    validate_stage_type_splits,
+)
 from spark_rapids_tools.tools.qualx.preprocess import (
     load_datasets,
     load_profiles,
@@ -288,16 +293,17 @@ def _roll_up_stage_type_predictions(results: pd.DataFrame) -> pd.DataFrame:
         'appDuration',
         'sqlID',
         'scaleFactor',
-        'description',
     ]
-    if 'split' in results.columns:
-        group_by_cols.append('split')
 
     agg_cols = {
         label: 'sum',
         f'{label}_pred': 'sum',
         f'{label}_supported': 'sum',
+        'description': 'first',
     }
+    if 'split' in results.columns:
+        validate_stage_type_splits(results, context='stageType prediction rows')
+        agg_cols['split'] = 'first'
     gpu_label_col = f'gpu_{label}'
     if gpu_label_col in results.columns:
         agg_cols[gpu_label_col] = 'sum'
@@ -311,6 +317,171 @@ def _roll_up_stage_type_predictions(results: pd.DataFrame) -> pd.DataFrame:
         rolled['y'] = rolled[label] / rolled[gpu_label_col]
         rolled['y'] = rolled['y'].replace([np.inf, -np.inf], np.nan)
     return rolled
+
+
+def _merge_qxs_duration_predictions(
+    raw_results: pd.DataFrame,
+    filtered_results: pd.DataFrame,
+    label: str,
+    keys: List[str],
+    record_name: str,
+) -> pd.DataFrame:
+    """Join QXS predictions by identity and preserve unfiltered duration totals."""
+    qxs_cols = {
+        label: f'_qxs_{label}',
+        f'{label}_supported': f'_qxs_{label}_supported_raw',
+        f'{label}_pred': f'_qxs_{label}_pred_raw',
+    }
+    qxs = filtered_results.reindex(columns=[*keys, *qxs_cols]).rename(columns=qxs_cols)
+    merged = raw_results.merge(qxs, on=keys, how='left', validate='one_to_one')
+
+    qxs_label = merged[f'_qxs_{label}']
+    qxs_supported = merged[f'_qxs_{label}_supported_raw']
+    qxs_pred = merged[f'_qxs_{label}_pred_raw']
+    adjusted_pred = qxs_pred + merged[label] - qxs_label
+    invalid = (
+        qxs_label.isna()
+        | qxs_supported.isna()
+        | qxs_pred.isna()
+        | ~np.isfinite(adjusted_pred)
+        | (adjusted_pred <= 0)
+    )
+    if invalid.any():
+        logger.warning(
+            'Using a 1.0 QXS fallback for %d %s records with no valid filtered prediction.',
+            int(invalid.sum()),
+            record_name,
+        )
+
+    supported_col = f'_qxs_{label}_supported'
+    pred_col = f'_qxs_{label}_pred'
+    merged[supported_col] = qxs_supported.clip(lower=0, upper=merged[label]).where(~invalid, 0.0)
+    merged[pred_col] = adjusted_pred.where(~invalid, merged[label])
+    merged['_qxs_speedup'] = np.where(
+        merged[label] > 0,
+        merged[label] / merged[pred_col],
+        1.0,
+    )
+    return merged.drop(columns=list(qxs_cols.values()))
+
+
+def _merge_qxs_sql_predictions(
+    raw_sql: pd.DataFrame,
+    filtered_sql: pd.DataFrame,
+    label: str,
+) -> pd.DataFrame:
+    """Join QXS predictions by SQL identity and preserve unfiltered duration totals."""
+    return _merge_qxs_duration_predictions(
+        raw_sql,
+        filtered_sql,
+        label,
+        ['appId', 'sqlID', 'scaleFactor'],
+        'SQL',
+    )
+
+
+def _merge_qxs_stage_type_predictions(
+    raw_stage_type: pd.DataFrame,
+    filtered_stage_type: pd.DataFrame,
+    label: str,
+) -> pd.DataFrame:
+    """Join QXS predictions by stageType identity and preserve unfiltered durations."""
+    return _merge_qxs_duration_predictions(
+        raw_stage_type,
+        filtered_stage_type,
+        label,
+        ['appId', 'sqlID', 'scaleFactor', STAGE_TYPE_COL],
+        STAGE_TYPE_COL,
+    )
+
+
+def _build_duration_evaluation_results(
+    raw_results: pd.DataFrame,
+    filtered_results: pd.DataFrame,
+    label: str,
+    *,
+    stage_type: bool = False,
+) -> pd.DataFrame:
+    """Build consistently named QX/QXS duration prediction records for evaluation."""
+    raw_cols = {
+        'appId': 'appId',
+        'sqlID': 'sqlID',
+        'scaleFactor': 'scaleFactor',
+        'appDuration': 'appDuration',
+        label: label,
+        f'gpu_{label}': f'Actual GPU {label}',
+        'y': 'Actual speedup',
+        f'{label}_supported': f'QX {label}_supported',
+        f'{label}_pred': f'QX {label}_pred',
+        'y_pred': 'QX speedup',
+        'split': 'split',
+    }
+    if stage_type:
+        raw_cols[STAGE_TYPE_COL] = STAGE_TYPE_COL
+
+    merged = raw_results.rename(raw_cols, axis=1)
+    selected_raw_cols = [col for col in raw_cols.values() if col in merged]
+    if stage_type:
+        merged = _merge_qxs_stage_type_predictions(merged, filtered_results, label)
+    else:
+        merged = _merge_qxs_sql_predictions(merged, filtered_results, label)
+
+    qxs_cols = {
+        f'_qxs_{label}_supported': f'QXS {label}_supported',
+        f'_qxs_{label}_pred': f'QXS {label}_pred',
+        '_qxs_speedup': 'QXS speedup',
+    }
+    merged = merged.rename(qxs_cols, axis=1)
+    return merged[[*selected_raw_cols, *qxs_cols.values()]]
+
+
+def _merge_qxs_app_predictions(
+    raw_app: pd.DataFrame,
+    filtered_app: pd.DataFrame,
+    label: str,
+) -> pd.DataFrame:
+    """Join QXS predictions by application identity and preserve raw application duration."""
+    qxs_cols = {
+        'appDuration': '_qxs_appDuration',
+        f'{label}_pred': f'_qxs_{label}_pred_raw',
+        f'{label}_supported': f'_qxs_{label}_supported_raw',
+        'appDuration_pred': '_qxs_appDuration_pred_raw',
+    }
+    qxs = filtered_app[['appId', *qxs_cols]].rename(columns=qxs_cols)
+    merged = raw_app.merge(qxs, on='appId', how='left', validate='one_to_one')
+
+    duration_delta = merged['appDuration'] - merged['_qxs_appDuration']
+    adjusted_label_pred = merged[f'_qxs_{label}_pred_raw'] + duration_delta
+    adjusted_app_pred = merged['_qxs_appDuration_pred_raw'] + duration_delta
+    qxs_supported = merged[f'_qxs_{label}_supported_raw']
+    invalid = (
+        merged['_qxs_appDuration'].isna()
+        | adjusted_label_pred.isna()
+        | qxs_supported.isna()
+        | ~np.isfinite(adjusted_app_pred)
+        | (adjusted_app_pred <= 0)
+    )
+    if invalid.any():
+        logger.warning(
+            'Using a 1.0 QXS fallback for %d applications with no valid filtered prediction.',
+            int(invalid.sum()),
+        )
+
+    supported_col = f'_qxs_{label}_supported'
+    merged[f'_qxs_{label}_pred'] = adjusted_label_pred.where(~invalid, 0.0)
+    merged[supported_col] = qxs_supported.clip(lower=0, upper=merged['appDuration']).where(~invalid, 0.0)
+    merged['_qxs_fraction_supported'] = np.where(
+        merged['appDuration'] > 0,
+        merged[supported_col] / merged['appDuration'],
+        0.0,
+    )
+    merged['_qxs_appDuration_pred'] = adjusted_app_pred.where(~invalid, merged['appDuration'])
+    merged['_qxs_speedup'] = np.where(
+        merged['appDuration'] > 0,
+        merged['appDuration'] / merged['_qxs_appDuration_pred'],
+        1.0,
+    )
+    return merged.drop(columns=list(qxs_cols.values()))
 
 
 def _compute_summary(results: pd.DataFrame) -> pd.DataFrame:
@@ -376,7 +547,16 @@ def _compute_summary(results: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def _predict(
+@dataclass
+class _PredictionFrames:
+    """Prediction rows at each aggregation level used by evaluation."""
+
+    per_sql: pd.DataFrame
+    per_app: pd.DataFrame
+    per_stage_type: pd.DataFrame
+
+
+def _predict_detailed(
     xgb_model,
     dataset: str,
     input_df: pd.DataFrame,
@@ -384,7 +564,7 @@ def _predict(
     split_fn: Callable[[pd.DataFrame], pd.DataFrame] = None,
     qual_tool_filter: Optional[str] = 'stage',
     calib_params: Optional[Dict[str, float]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> _PredictionFrames:
     label = get_label()
     results = pd.DataFrame(
         columns=[
@@ -398,6 +578,7 @@ def _predict(
             'speedup_pred',
         ]
     )
+    stage_type_results = pd.DataFrame(columns=[*results.columns, STAGE_TYPE_COL])
     summary = pd.DataFrame(
         columns=[
             'appId',
@@ -420,6 +601,8 @@ def _predict(
         # note: dataset name is already stored in the 'appName' field
         try:
             results = predict_model(xgb_model, features, feature_cols, label_col, calib_params)
+            if is_duration_sum_stage_type_enabled() and STAGE_TYPE_COL in results.columns:
+                stage_type_results = results.copy()
             results = _roll_up_stage_type_predictions(results)
 
             # compute per-app speedups
@@ -434,7 +617,28 @@ def _predict(
             # ignore and continue
             logger.error(e)
             traceback.print_exc()
-    return results, summary
+    return _PredictionFrames(results, summary, stage_type_results)
+
+
+def _predict(
+    xgb_model,
+    dataset: str,
+    input_df: pd.DataFrame,
+    *,
+    split_fn: Callable[[pd.DataFrame], pd.DataFrame] = None,
+    qual_tool_filter: Optional[str] = 'stage',
+    calib_params: Optional[Dict[str, float]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Predict SQL and application results while preserving the existing caller contract."""
+    predictions = _predict_detailed(
+        xgb_model,
+        dataset,
+        input_df,
+        split_fn=split_fn,
+        qual_tool_filter=qual_tool_filter,
+        calib_params=calib_params,
+    )
+    return predictions.per_sql, predictions.per_app
 
 
 def _read_dataset_scores(
@@ -449,7 +653,7 @@ def _read_dataset_scores(
     score: str
         Type of metric to report.
     granularity: str
-        Aggregation level for metric: sql, app.
+        Aggregation level for metric: sql, app, stageType.
     split: str
         Name of data split to report: train, test, val, all.
         Note: for 'app' granularity, only 'all' is supported.
@@ -464,9 +668,11 @@ def _read_dataset_scores(
         .reset_index(drop=True)
     )
 
-    nan_df = df[df.isna().any(axis=1)].copy()
+    score_cols = [col for col in ['QX', 'QXS'] if col in df.columns]
+    nan_mask = df[score_cols].isna().any(axis=1)
+    nan_df = df[nan_mask].copy()
     if not nan_df.empty:
-        df.dropna(inplace=True)
+        df = df.loc[~nan_mask].copy()
         nan_df['key'] = (
             nan_df['model'] + '/' + nan_df['platform'] + '/' + nan_df['dataset']
         )
@@ -1095,7 +1301,7 @@ def evaluate(
             split_fn = load_plugin(get_abs_path('split_train_val.py', 'split_functions')).split_function
 
     # raw predictions on unfiltered data
-    raw_sql, raw_app = _predict(
+    raw_predictions = _predict_detailed(
         xgb_model,
         dataset_name,
         profile_df,
@@ -1103,6 +1309,9 @@ def evaluate(
         qual_tool_filter=qual_filter,
         calib_params=calib_params
     )
+    raw_sql = raw_predictions.per_sql
+    raw_app = raw_predictions.per_app
+    raw_stage_type = raw_predictions.per_stage_type
 
     # app level ground truth
     app_durations = (
@@ -1132,7 +1341,7 @@ def evaluate(
     raw_app['speedup_actual'] = raw_app['appDuration'] / raw_app['appDuration_actual']
 
     # adjusted prediction on filtered data
-    filtered_sql, filtered_app = _predict(
+    filtered_predictions = _predict_detailed(
         xgb_model,
         dataset_name,
         filtered_profile_df,
@@ -1140,44 +1349,21 @@ def evaluate(
         qual_tool_filter=qual_filter,
         calib_params=calib_params
     )
+    filtered_sql = filtered_predictions.per_sql
+    filtered_app = filtered_predictions.per_app
+    filtered_stage_type = filtered_predictions.per_stage_type
 
     # merge results and join w/ qual_preds
     label = get_label()
-    raw_sql_cols = {
-        'appId': 'appId',
-        'sqlID': 'sqlID',
-        'scaleFactor': 'scaleFactor',
-        'appDuration': 'appDuration',
-        label: label,
-        f'gpu_{label}': f'Actual GPU {label}',
-        'y': 'Actual speedup',
-        f'{label}_supported': f'QX {label}_supported',
-        f'{label}_pred': f'QX {label}_pred',
-        'y_pred': 'QX speedup',
-        'split': 'split',
-    }
-    raw_sql = raw_sql.rename(raw_sql_cols, axis=1)
-    raw_cols = [col for col in raw_sql_cols.values() if col in raw_sql]
-
-    filtered_sql_cols = {
-        'appId': 'appId',
-        'appDuration': 'appDuration',
-        'sqlID': 'sqlID',
-        'scaleFactor': 'scaleFactor',
-        label: label,
-        f'{label}_supported': f'QXS {label}_supported',
-        f'{label}_pred': f'QXS {label}_pred',
-        # 'y_pred': 'QX speedup',
-        'speedup_pred': 'QXS speedup',
-    }
-    filtered_sql = filtered_sql.rename(filtered_sql_cols, axis=1)
-
-    results_sql = raw_sql[raw_cols].merge(
-        filtered_sql[filtered_sql_cols.values()],
-        on=['appId', 'sqlID', 'scaleFactor', 'appDuration', label],
-        how='left',
-        suffixes=[None, '_filtered']
-    )
+    results_sql = _build_duration_evaluation_results(raw_sql, filtered_sql, label)
+    results_stage_type = pd.DataFrame()
+    if is_duration_sum_stage_type_enabled():
+        results_stage_type = _build_duration_evaluation_results(
+            raw_stage_type,
+            filtered_stage_type,
+            label,
+            stage_type=True,
+        )
 
     raw_app_cols = {
         'appId': 'appId',
@@ -1191,22 +1377,16 @@ def evaluate(
     }
     raw_app = raw_app.rename(raw_app_cols, axis=1)
 
-    filtered_app_cols = {
-        'appId': 'appId',
-        'appDuration': 'appDuration',
-        f'{label}_pred': f'QXS {label}_pred',
-        f'{label}_supported': f'QXS {label}_supported',
-        'fraction_supported': 'QXS fraction_supported',
-        'appDuration_pred': 'QXS appDuration_pred',
-        'speedup': 'QXS speedup',
+    raw_app = _merge_qxs_app_predictions(raw_app, filtered_app, label)
+    qxs_app_cols = {
+        f'_qxs_{label}_pred': f'QXS {label}_pred',
+        f'_qxs_{label}_supported': f'QXS {label}_supported',
+        '_qxs_fraction_supported': 'QXS fraction_supported',
+        '_qxs_appDuration_pred': 'QXS appDuration_pred',
+        '_qxs_speedup': 'QXS speedup',
     }
-    filtered_app = filtered_app.rename(filtered_app_cols, axis=1)
-
-    results_app = raw_app[raw_app_cols.values()].merge(
-        filtered_app[filtered_app_cols.values()],
-        on=['appId', 'appDuration'],
-        how='left',
-    )
+    raw_app = raw_app.rename(qxs_app_cols, axis=1)
+    results_app = raw_app[[*raw_app_cols.values(), *qxs_app_cols.values()]]
 
     print(
         '\nComparison of qualx raw (QX) and qualx w/ stage filtering (QXS)'
@@ -1214,16 +1394,38 @@ def evaluate(
     print(tabulate(results_app, headers='keys', tablefmt='psql', floatfmt='.2f'))
     print()
 
-    # compute mean abs percentage error (MAPE) for each tool (QX, QXS)
+    # compute accuracy scores for each tool (QX, QXS)
+    evaluation_groups = [
+        ('sql', pd.NA, 'test', results_sql, label),
+        ('sql', pd.NA, 'all', results_sql, label),
+        ('app', pd.NA, 'all', results_app, 'appDuration'),
+    ]
+    if is_duration_sum_stage_type_enabled():
+        for stage_type in STAGE_TYPE_VALUES:
+            stage_type_results = results_stage_type.loc[
+                results_stage_type[STAGE_TYPE_COL] == stage_type
+            ]
+            evaluation_groups.extend([
+                ('stageType', stage_type, 'test', stage_type_results, label),
+                ('stageType', stage_type, 'all', stage_type_results, label),
+            ])
 
     score_dfs = []
-    for granularity, split in [('sql', 'test'), ('sql', 'all'), ('app', 'all')]:
-        res = results_app if granularity == 'app' else results_sql
-        res = res[res.split == 'test'] if split == 'test' else res
+    for granularity, stage_type, split, group_results, weight in evaluation_groups:
+        if split == 'test' and 'split' not in group_results:
+            res = group_results.iloc[0:0]
+        else:
+            res = (
+                group_results[group_results.split == 'test']
+                if split == 'test'
+                else group_results
+            )
         if res.empty:
+            stage_type_msg = f'={stage_type}' if not pd.isna(stage_type) else ''
             logger.warning(
-                'No per-%s %s evaluation results found for dataset: %s',
+                'No per-%s%s %s evaluation results found for dataset: %s',
                 granularity,
+                stage_type_msg,
                 split,
                 dataset,
             )
@@ -1231,16 +1433,39 @@ def evaluate(
 
         if 'Actual speedup' not in res:
             logger.error('No GPU rows found for dataset: %s', dataset)
+            continue
+
+        required_cols = ['Actual speedup', 'QX speedup', 'QXS speedup', weight]
+        valid_rows = res[required_cols].notna().all(axis=1)
+        missing_actual_count = int(res['Actual speedup'].isna().sum())
+        invalid_count = int((~valid_rows).sum())
+        if invalid_count:
+            logger.warning(
+                'Excluding %d of %d per-%s%s %s records with incomplete accuracy inputs '
+                '(%d missing actual speedups).',
+                invalid_count,
+                len(res),
+                granularity,
+                f'={stage_type}' if not pd.isna(stage_type) else '',
+                split,
+                missing_actual_count,
+            )
+            res = res.loc[valid_rows]
+        if res.empty:
+            continue
 
         scores = compute_accuracy(
             res,
             'Actual speedup',
             {'QX': 'QX speedup', 'QXS': 'QXS speedup'},
-            'appDuration' if granularity == 'app' else label,
+            weight,
         )
 
         score_df = pd.DataFrame(scores)
-        print(f'Scores per {granularity} ({split}):')
+        display_granularity = (
+            f'{granularity}={stage_type}' if not pd.isna(stage_type) else granularity
+        )
+        print(f'Scores per {display_granularity} ({split}):')
         print(tabulate(score_df.transpose(), headers='keys', floatfmt='.4f'))
         print()
 
@@ -1250,16 +1475,34 @@ def evaluate(
         score_df.insert(loc=1, column='platform', value=platform)
         score_df.insert(loc=2, column='dataset', value=dataset_name)
         score_df.insert(loc=3, column='granularity', value=granularity)
-        score_df.insert(loc=4, column='split', value=split)
+        score_df.insert(loc=4, column=STAGE_TYPE_COL, value=stage_type)
+        score_df.insert(loc=5, column='split', value=split)
+        score_df.insert(loc=6, column='count', value=len(res))
+        score_df.insert(loc=7, column='missingActualCount', value=missing_actual_count)
+        score_df.insert(loc=8, column='totalDuration', value=res[weight].sum())
         score_dfs.append(score_df)
 
-    # write mape scores as CSV
+    # write accuracy scores as CSV
     scores_path = os.path.join(output_dir, f'{dataset_name}_mape.csv')
     if score_dfs:
-        ds_scores_df = pd.concat(score_dfs)
+        ds_scores_df = pd.concat(score_dfs, ignore_index=True)
+        ds_scores_df[STAGE_TYPE_COL] = ds_scores_df[STAGE_TYPE_COL].astype('Int64')
     else:
         ds_scores_df = pd.DataFrame(
-            columns=['model', 'platform', 'dataset', 'granularity', 'split', 'score', 'QX', 'QXS']
+            columns=[
+                'model',
+                'platform',
+                'dataset',
+                'granularity',
+                STAGE_TYPE_COL,
+                'split',
+                'count',
+                'missingActualCount',
+                'totalDuration',
+                'score',
+                'QX',
+                'QXS',
+            ]
         )
     ds_scores_df.to_csv(scores_path, index=False)
 
@@ -1271,6 +1514,14 @@ def evaluate(
     app_predictions_path = os.path.join(output_dir, f'{dataset_name}_app.csv')
     logger.info('Writing per-application predictions to: %s', app_predictions_path)
     results_app.to_csv(app_predictions_path, index=False, na_rep='nan')
+
+    if is_duration_sum_stage_type_enabled():
+        stage_type_predictions_path = os.path.join(
+            output_dir,
+            f'{dataset_name}_stage_type.csv',
+        )
+        logger.info('Writing per-stageType predictions to: %s', stage_type_predictions_path)
+        results_stage_type.to_csv(stage_type_predictions_path, index=False, na_rep='nan')
 
 
 def evaluate_summary(
@@ -1287,7 +1538,7 @@ def evaluate_summary(
     evaluate: str
         Path to evaluation results directory.
     score: str
-        Type of score to compare: 'MAPE', 'wMAPE', or 'dMAPE' (default).
+        Type of score to compare: 'MAPE', 'wMAPE', 'dMAPE' (default), or 'KendallTau'.
     split: str
         Dataset split to compare: 'test' (default), 'train', or 'all'.
     config:
@@ -1323,9 +1574,9 @@ def compare(
     current: str
         Path to current evaluation results directory.
     score: str
-        Type of score to compare: 'MAPE', 'wMAPE', or 'dMAPE' (default).
+        Type of score to compare: 'MAPE', 'wMAPE', 'dMAPE' (default), or 'KendallTau'.
     granularity: str
-        Granularity of score to compare: 'sql' (default) or 'app'.
+        Granularity of score to compare: 'sql' (default), 'app', or 'stageType'.
     split: str
         Dataset split to compare: 'all' (default), 'train', or 'test'.
     config:
@@ -1334,14 +1585,17 @@ def compare(
     # load config from command line argument, or use default
     get_config(config)
 
-    # compare MAPE scores per dataset
+    # compare accuracy scores per dataset
     curr_df = _read_dataset_scores(current, score, granularity, split)
     prev_df = _read_dataset_scores(previous, score, granularity, split)
 
+    merge_cols = ['model', 'platform', 'dataset', 'granularity', 'split', 'score']
+    if STAGE_TYPE_COL in prev_df.columns and STAGE_TYPE_COL in curr_df.columns:
+        merge_cols.append(STAGE_TYPE_COL)
     compare_df = prev_df.merge(
         curr_df,
         how='right',
-        on=['model', 'platform', 'dataset', 'granularity', 'split', 'score'],
+        on=merge_cols,
         suffixes=('_prev', None),
     )
     for score_type in ['QX', 'QXS']:
@@ -1353,7 +1607,7 @@ def compare(
     logger.info('Writing dataset evaluation comparison to: %s', comparison_path)
     compare_df.to_csv(comparison_path)
 
-    # compare app MAPE scores per platform
+    # compare app accuracy scores per platform
     # note: these aggregated scores can be impacted by the addition/removal of datasets
     # for removed datasets, just filter out from 'previous' aggregations
     # for added datasets, warn after printing table for more visibility
